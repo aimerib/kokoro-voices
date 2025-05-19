@@ -11,4 +11,8 @@ git+https://github.com/aimerib/whisper-mps.git
 
 kokoro
 
+# Visualization tools
+tensorboard
+wandb
+
 tqdm

@@ -27,12 +27,24 @@ import argparse
 import math
 import os
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Union, Dict, Any
 
 import torch
 import torchaudio
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Import visualization tools
+from torch.utils.tensorboard import SummaryWriter
+
+# Optional W&B import - will be checked before use
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 from kokoro import KModel, KPipeline
 
@@ -121,9 +133,42 @@ def train(
     n_mels: int = 80,
     n_fft: int = 1024,
     hop: int = 256,
+    use_tensorboard: bool = False,
+    use_wandb: bool = False,
+    wandb_project: Optional[str] = None,
+    wandb_name: Optional[str] = None,
+    log_audio_every: int = 10,
+    log_dir: Optional[str] = None,
 ):
     device = get_device()
     print(f"Using device: {device}")
+    
+    # Set up monitoring tools
+    writer = None
+    if use_tensorboard:
+        log_dir = log_dir or os.path.join('runs', Path(out).stem)
+        writer = SummaryWriter(log_dir)
+        print(f"TensorBoard logs will be saved to {log_dir}")
+    
+    if use_wandb:
+        if not WANDB_AVAILABLE:
+            print("WARNING: W&B not available. Please install with 'pip install wandb'")
+        else:
+            wandb.init(
+                project=wandb_project or "kokoro-voice-training",
+                name=wandb_name or Path(out).stem,
+                config={
+                    "learning_rate": lr,
+                    "epochs": epochs,
+                    "batch_size": batch_size,
+                    "n_mels": n_mels,
+                    "n_fft": n_fft,
+                    "hop_length": hop,
+                    "output": out,
+                    "data_root": str(data_root),
+                }
+            )
+            print(f"W&B project initialized: {wandb_project or 'kokoro-voice-training'}")
 
     # Create two separate mel transforms - one for CPU (dataset) and one for device (training)
     mel_transform_cpu = torchaudio.transforms.MelSpectrogram(
@@ -282,9 +327,115 @@ def train(
             epoch_loss += loss.item()
             # print current step statistics
             print(f"{text[:20]}: loss {loss.item():.4f} - {len(phonemes)} phonemes - epoch loss {epoch_loss:.4f}")
+            
+            # Log individual losses for current batch
+            step = (epoch - 1) * len(loader) + loader.batch_size
+            if writer is not None:
+                writer.add_scalar('Batch/L1_Loss', l1_loss.item(), step)
+                writer.add_scalar('Batch/MSE_Loss', mse_loss.item(), step)
+                writer.add_scalar('Batch/Freq_Loss', freq_loss.item(), step)
+                writer.add_scalar('Batch/Combined_Loss', loss.item(), step)
+                
+            if use_wandb and WANDB_AVAILABLE:
+                wandb.log({
+                    'batch_l1_loss': l1_loss.item(),
+                    'batch_mse_loss': mse_loss.item(),
+                    'batch_freq_loss': freq_loss.item(),
+                    'batch_loss': loss.item(),
+                    'step': step
+                })
 
         avg_loss = epoch_loss / len(loader)
         print(f"Epoch {epoch:>3}/{epochs}: loss {avg_loss:.4f}")
+        
+        # Log epoch metrics
+        if writer is not None:
+            writer.add_scalar('Epoch/Loss', avg_loss, epoch)
+            writer.add_scalar('Epoch/Learning_Rate', optim.param_groups[0]['lr'], epoch)
+            
+            # Log voice embedding stats
+            timbre_data = base_voice[0, :128].detach().cpu().numpy()
+            style_data = base_voice[0, 128:].detach().cpu().numpy()
+            
+            # Create histograms for timbre and style components
+            writer.add_histogram('Voice/Timbre', timbre_data, epoch)
+            writer.add_histogram('Voice/Style', style_data, epoch)
+            
+            # Log voice statistics
+            writer.add_scalar('Voice/Timbre_Mean', timbre_data.mean(), epoch)
+            writer.add_scalar('Voice/Timbre_Std', timbre_data.std(), epoch)
+            writer.add_scalar('Voice/Style_Mean', style_data.mean(), epoch)
+            writer.add_scalar('Voice/Style_Std', style_data.std(), epoch)
+        
+        if use_wandb and WANDB_AVAILABLE:
+            metrics = {
+                'epoch': epoch,
+                'epoch_loss': avg_loss,
+                'learning_rate': optim.param_groups[0]['lr'],
+                'timbre_mean': base_voice[0, :128].mean().item(),
+                'timbre_std': base_voice[0, :128].std().item(),
+                'style_mean': base_voice[0, 128:].mean().item(),
+                'style_std': base_voice[0, 128:].std().item(),
+            }
+            wandb.log(metrics)
+            
+            # Log histograms in W&B
+            wandb.log({
+                'timbre_hist': wandb.Histogram(base_voice[0, :128].detach().cpu().numpy()),
+                'style_hist': wandb.Histogram(base_voice[0, 128:].detach().cpu().numpy())
+            })
+        
+        # Log audio samples periodically
+        if (epoch % log_audio_every == 0 or epoch == epochs) and (writer is not None or use_wandb):
+            # Generate a sample with current voice embedding
+            with torch.no_grad():
+                # Use the first training sample for consistent comparison
+                sample_text = dataset.sentences[0]
+                phonemes, _ = g2p.g2p(sample_text)
+                
+                if phonemes:
+                    # Generate audio
+                    ids = text_to_input_ids(model, phonemes).to(device)
+                    audio_sample, _ = model.forward_with_tokens.__wrapped__(model, ids, base_voice)
+                    audio_sample = audio_sample.squeeze().cpu().numpy()
+                    
+                    # Generate mel spectrogram for visualization
+                    with torch.no_grad():
+                        mel = mel_transform_cpu(torch.tensor(audio_sample).unsqueeze(0))
+                        log_mel_sample = 20 * torch.log10(mel.clamp(min=1e-5))[0].cpu().numpy()
+                    
+                    # Log to TensorBoard
+                    if writer is not None:
+                        writer.add_audio(f'Sample/{sample_text[:30]}', 
+                                         audio_sample.reshape(1, -1), 
+                                         epoch, 
+                                         sample_rate=24000)
+                        
+                        # Create and log mel spectrogram figure
+                        fig, ax = plt.subplots(figsize=(10, 4))
+                        im = ax.imshow(log_mel_sample, aspect='auto', origin='lower')
+                        plt.colorbar(im, ax=ax)
+                        plt.title(f'Epoch {epoch}: {sample_text[:30]}')
+                        plt.tight_layout()
+                        writer.add_figure('Spectrogram/Sample', fig, epoch)
+                        plt.close(fig)
+                    
+                    # Log to W&B
+                    if use_wandb and WANDB_AVAILABLE:
+                        wandb.log({f"audio_sample_epoch_{epoch}": wandb.Audio(
+                            audio_sample, 
+                            sample_rate=24000,
+                            caption=f"Epoch {epoch}: {sample_text[:30]}"
+                        )})
+                        
+                        # Log spectrogram to W&B
+                        fig, ax = plt.subplots(figsize=(10, 4))
+                        im = ax.imshow(log_mel_sample, aspect='auto', origin='lower')
+                        plt.colorbar(im, ax=ax)
+                        plt.title(f'Epoch {epoch}: {sample_text[:30]}')
+                        plt.tight_layout()
+                        wandb.log({f"spectrogram_epoch_{epoch}": wandb.Image(fig)})
+                        plt.close(fig)
         
         # Update scheduler based on validation loss
         scheduler.step(avg_loss)
@@ -328,6 +479,13 @@ def train(
     
     # Save the final voice tensor
     save_voice(base_voice, voice_embed, out)
+    
+    # Close monitoring tools
+    if writer is not None:
+        writer.close()
+        
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.finish()
 
 def save_voice(base_voice, voice_embed, out):
     # ---------------------------------------------------------------------
@@ -352,17 +510,32 @@ def save_voice(base_voice, voice_embed, out):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Train a Kokoro voice embedding")
-    ap.add_argument("--data", required=True, help="Directory containing WAVs and prompts.txt")
-    ap.add_argument("--epochs", type=int, default=200, help="Training epochs (default: 200)")
-    ap.add_argument("--lr", type=float, default=1e-2, help="Initial learning rate (default: 1e-2)")
-    ap.add_argument("--batch", type=int, default=1, help="Batch size (default: 1)")
-    ap.add_argument("--out", default="my_voice.pt", help="Output .pt filename")
+    ap.add_argument("--data", type=str, help="Path to dataset directory")
+    ap.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
+    ap.add_argument("--batch-size", type=int, default=1, help="Batch size")
+    ap.add_argument("--lr", type=float, default=1e-2, help="Learning rate")
+    ap.add_argument("--out", type=str, default="my_voice.pt", help="Output voice file")
+    
+    # Add monitoring arguments
+    monitoring_group = ap.add_argument_group('Monitoring')
+    monitoring_group.add_argument("--tensorboard", action="store_true", help="Enable TensorBoard logging")
+    monitoring_group.add_argument("--log-dir", type=str, help="Directory for TensorBoard logs (default: runs/voice_name)")
+    monitoring_group.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    monitoring_group.add_argument("--wandb-project", type=str, help="W&B project name")
+    monitoring_group.add_argument("--wandb-name", type=str, help="W&B run name")
+    monitoring_group.add_argument("--log-audio-every", type=int, default=10, help="Log audio samples every N epochs")
     args = ap.parse_args()
 
     train(
         data_root=args.data,
         epochs=args.epochs,
-        batch_size=args.batch,
+        batch_size=args.batch_size,
         lr=args.lr,
         out=args.out,
+        use_tensorboard=args.tensorboard,
+        use_wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_name=args.wandb_name,
+        log_audio_every=args.log_audio_every,
+        log_dir=args.log_dir,
     )
