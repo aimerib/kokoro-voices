@@ -1,0 +1,4 @@
+*.wav
+input/*
+output/*
+!.gitkeep

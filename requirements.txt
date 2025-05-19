@@ -1,0 +1,14 @@
+torch
+numpy
+matplotlib
+huggingface_hub
+
+torchaudio
+soundfile
+
+openai-whisper
+git+https://github.com/aimerib/whisper-mps.git
+
+kokoro
+
+tqdm

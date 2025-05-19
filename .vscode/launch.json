@@ -1,0 +1,28 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Module",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "examples/use_custom_voice.py",
+        },
+        {
+            "name": "Prepare Dataset",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "prepare_dataset.py",
+            "args": [
+                "--input",
+                "input/myvoice/longexample.wav",
+                "--output",
+                "input/myvoice/dataset",
+                "--model",
+                "turbo"
+            ],
+        }
+    ]
+}
