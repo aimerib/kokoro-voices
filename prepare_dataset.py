@@ -73,10 +73,14 @@ def load_audio(file_path, sr=16000):
 
 def segment_audio(audio, sample_rate, segments, min_duration=1.0, max_duration=10.0):
     """
-    Split audio into segments based on Whisper transcription
+    Split audio into segments based on Whisper transcription with natural word boundaries
     Returns a list of (audio_segment, text, start_time, end_time) tuples
     """
     results = []
+    
+    # Add padding to create natural boundaries (100ms before, 200ms after)
+    padding_before = int(0.1 * sample_rate)  # 100ms before speech starts
+    padding_after = int(0.2 * sample_rate)   # 200ms after speech ends
     
     for segment in segments:
         start_sample = int(segment["start"] * sample_rate)
@@ -87,8 +91,12 @@ def segment_audio(audio, sample_rate, segments, min_duration=1.0, max_duration=1
         if duration < min_duration or duration > max_duration:
             continue
         
-        # Get audio segment
-        audio_segment = audio[start_sample:end_sample]
+        # Adjust boundaries with padding for more natural sound
+        padded_start = max(0, start_sample - padding_before)
+        padded_end = min(len(audio), end_sample + padding_after)
+        
+        # Get audio segment with padding
+        audio_segment = audio[padded_start:padded_end]
         
         # Get text
         text = segment["text"].strip()
@@ -101,6 +109,7 @@ def segment_audio(audio, sample_rate, segments, min_duration=1.0, max_duration=1
         if not re.search(r'\w', text):
             continue
         
+        # Store with original timestamps (for tracking purposes)
         results.append((audio_segment, text, segment["start"], segment["end"]))
     
     return results

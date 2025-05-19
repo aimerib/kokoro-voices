@@ -192,7 +192,7 @@ def train(
     
     # Scheduler for better convergence
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optim, mode='min', factor=0.5, patience=10, verbose=True
+        optim, mode='min', factor=0.5, patience=10
     )
     
     # Multiple loss functions for better results
