@@ -379,23 +379,6 @@ def train(
     # Track best validation loss for saving best checkpoint
     best_val_loss = float('inf')
     best_epoch = 0
-    
-    # # Learning rate scheduling based on specified policy
-    # if lr_decay_schedule is None or lr_decay_schedule == 'plateau':
-    #     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    #         optim, mode='min', factor=lr_decay_rate, patience=5  # Reduced patience from 10 to 5
-    #     )
-    # elif lr_decay_schedule == 'step':
-    #     # Default steps if none provided
-    #     steps = lr_decay_epochs or [int(epochs * 0.3), int(epochs * 0.6), int(epochs * 0.8)]
-    #     scheduler = torch.optim.lr_scheduler.MultiStepLR(
-    #         optim, milestones=steps, gamma=lr_decay_rate
-    #     )
-    # elif lr_decay_schedule == 'auto':
-    #     # Automatically decay learning rate every few epochs
-    #     scheduler = torch.optim.lr_scheduler.StepLR(
-    #         optim, step_size=5, gamma=lr_decay_rate  # Decay every 5 epochs
-    #     )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optim, T_max=epochs, eta_min=1e-5
@@ -712,8 +695,7 @@ def train(
                         wandb.log({f"spectrogram_epoch_{epoch}": wandb.Image(fig)})
                         plt.close(fig)
         
-        metric_for_scheduler = validation_loss if validation_loss is not None else avg_loss
-        scheduler.step(metric_for_scheduler)
+        scheduler.step()
         
         # Monitor embedding statistics to potentially freeze timbre
         current_timbre = base_voice[0, :128]
@@ -1014,7 +996,7 @@ if __name__ == "__main__":
     ap.add_argument("--data", type=str, help="Path to dataset directory")
     ap.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
     ap.add_argument("--batch-size", type=int, default=1, help="Batch size")
-    ap.add_argument("--lr", type=float, default=1e-2, help="Learning rate")
+    ap.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     ap.add_argument("--name", type=str, default="my_voice", help="Output voice file")
     ap.add_argument("--out", type=str, default="output", help="Output directory")
     ap.add_argument("--dataset-id", type=str,
@@ -1036,9 +1018,9 @@ if __name__ == "__main__":
                               help="Factor to multiply learning rate by when decaying (e.g., 0.5 = halve it)")
     training_group.add_argument("--lr-decay-epochs", type=int, nargs='+',
                               help="Epochs at which to decay learning rate (only for 'step' decay)")
-    training_group.add_argument("--timbre-freeze", type=float, default=None,
+    training_group.add_argument("--timbre-freeze", type=float, default=0.25,
                               help="Freeze timbre part of embedding when its std reaches this value (e.g., 0.5)")
-    training_group.add_argument("--style-reg", type=float, default=None,
+    training_group.add_argument("--style-reg", type=float, default=1e-3,
                               help="L2 regularization strength for style part of embedding (e.g., 1e-4)")
     training_group.add_argument("--skip-validation", type=bool, default=False,
                               help="Skip validation split (default: False)")
