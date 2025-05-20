@@ -309,8 +309,7 @@ def train(
     #     )
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optim, mode='min', factor=0.5, patience=8, verbose=True,
-        min_lr=5e-5       # ❶  never go below this
+        optim, mode='min', factor=0.5, patience=8, min_lr=5e-5
     )
     
     # Multiple loss functions for better results
