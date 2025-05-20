@@ -28,6 +28,7 @@ import math
 import os
 from pathlib import Path
 from typing import List, Tuple, Optional, Union, Dict, Any
+import random
 
 import torch
 import torchaudio
@@ -35,6 +36,12 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 import numpy as np
+
+from huggingface_hub import snapshot_download
+
+
+from dotenv import load_dotenv
+load_dotenv()
 
 # Import visualization tools
 from torch.utils.tensorboard import SummaryWriter
@@ -77,8 +84,8 @@ class VoiceDataset(Dataset):
 
         with prompts.open() as f:
             for i, line in enumerate(f):
-                if i >= 60:
-                    break
+                # if i >= 60:
+                #     break
                 line = line.strip()
                 if not line:
                     continue
@@ -129,7 +136,8 @@ def train(
     epochs: int = 200,
     batch_size: int = 1,
     lr: float = 1e-2,
-    out: str = "my_voice.pt",
+    out: str = "output",
+    name: str = "my_voice",
     n_mels: int = 80,
     n_fft: int = 1024,
     hop: int = 256,
@@ -139,9 +147,25 @@ def train(
     wandb_name: Optional[str] = None,
     log_audio_every: int = 10,
     log_dir: Optional[str] = None,
+    gradient_accumulation_steps: int = 1,
+    memory_efficient: bool = True,
+    # Advanced training controls
+    lr_decay_schedule: Optional[str] = None,       # 'auto', 'step', or 'plateau'
+    lr_decay_rate: float = 0.5,                    # Factor to multiply LR when decaying
+    lr_decay_epochs: List[int] = None,             # For 'step' schedule, epochs to decay
+    timbre_freeze_threshold: Optional[float] = None, # Freeze timbre embedding when std reaches this value
+    style_regularization: Optional[float] = None,   # L2 regularization on style part of embedding
+    validation_set_size: int = 0,                  # Number of samples to hold out for validation
 ):
     device = get_device()
     print(f"Using device: {device}")
+    
+    # Memory optimization settings
+    if memory_efficient and device.type == "mps":
+        print("Enabling memory optimization settings for MPS")
+        # Force garbage collection to run more aggressively
+        gc.enable()
+        print(f"MPS HIGH_WATERMARK_RATIO set to {os.environ.get('PYTORCH_MPS_HIGH_WATERMARK_RATIO', 'default')}")
     
     # Set up monitoring tools
     writer = None
@@ -169,7 +193,11 @@ def train(
                 }
             )
             print(f"W&B project initialized: {wandb_project or 'kokoro-voice-training'}")
-
+    
+    # Set random seed for reproducibility
+    torch.manual_seed(42)
+    random.seed(42)
+    
     # Create two separate mel transforms - one for CPU (dataset) and one for device (training)
     mel_transform_cpu = torchaudio.transforms.MelSpectrogram(
         sample_rate=24_000, n_fft=n_fft, hop_length=hop, n_mels=n_mels
@@ -179,8 +207,35 @@ def train(
         sample_rate=24_000, n_fft=n_fft, hop_length=hop, n_mels=n_mels
     ).to(device)
 
+    # Create dataset
     dataset = VoiceDataset(data_root, mel_transform_cpu)
+    
+    # Split into training and validation sets if validation set size is specified
+    validation_dataset = None
+    if validation_set_size > 0 and validation_set_size < len(dataset):
+        # Create indices for the split
+        indices = list(range(len(dataset)))
+        random.shuffle(indices)
+        val_indices = indices[:validation_set_size]
+        train_indices = indices[validation_set_size:]
+        
+        # Create a copy of the dataset for validation
+        # This way we keep the same dataset class but access different samples
+        validation_dataset = VoiceDataset(data_root, mel_transform_cpu)
+        validation_dataset.sentences = [dataset.sentences[i] for i in val_indices]
+        validation_dataset.wav_paths = [dataset.wav_paths[i] for i in val_indices]
+        
+        # Update training dataset to exclude validation samples
+        dataset.sentences = [dataset.sentences[i] for i in train_indices]
+        dataset.wav_paths = [dataset.wav_paths[i] for i in train_indices]
+        
+        print(f"Split dataset: {len(dataset)} training samples, {len(validation_dataset)} validation samples")
+    
+    # Create data loaders
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    validation_loader = None
+    if validation_dataset:
+        validation_loader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=False)
 
     # ---------------------------------------------------------------------
     # Model + voice embedding
@@ -235,10 +290,22 @@ def train(
     # Set up optimizer with weight decay for regularization
     optim = torch.optim.Adam([base_voice], lr=lr, weight_decay=1e-6)
     
-    # Scheduler for better convergence
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optim, mode='min', factor=0.5, patience=10
-    )
+    # Learning rate scheduling based on specified policy
+    if lr_decay_schedule is None or lr_decay_schedule == 'plateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optim, mode='min', factor=lr_decay_rate, patience=5  # Reduced patience from 10 to 5
+        )
+    elif lr_decay_schedule == 'step':
+        # Default steps if none provided
+        steps = lr_decay_epochs or [int(epochs * 0.3), int(epochs * 0.6), int(epochs * 0.8)]
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optim, milestones=steps, gamma=lr_decay_rate
+        )
+    elif lr_decay_schedule == 'auto':
+        # Automatically decay learning rate every few epochs
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optim, step_size=5, gamma=lr_decay_rate  # Decay every 5 epochs
+        )
     
     # Multiple loss functions for better results
     l1_loss_fn = nn.L1Loss()
@@ -249,7 +316,17 @@ def train(
 
     for epoch in range(1, epochs + 1):
         epoch_loss = 0.0
+        batch_count = 0
+        
+        # Clear cache at the beginning of each epoch
+        if memory_efficient and device.type == "mps":
+            # Release unused memory
+            if hasattr(torch.mps, 'empty_cache'):
+                torch.mps.empty_cache()
+            gc.collect()
+            
         for text, target_log_mel in loader:
+            batch_count += 1
             text = text[0]  # batch_size=1
             target_log_mel = target_log_mel.to(device)
             # Dataset now consistently returns (1, n_mels, T) shape
@@ -275,9 +352,10 @@ def train(
             voice_for_input = base_voice  # Already [1, 256] and requires_grad=True
                 
             # Forward pass – call the *undecorated* version to retain gradients
-            audio_pred, _ = model.forward_with_tokens.__wrapped__(  # type: ignore[attr-defined]
-                model, ids, voice_for_input
-            )
+            with torch.autocast(device_type=device.type if device.type != 'mps' else 'cpu', enabled=memory_efficient):
+                audio_pred, _ = model.forward_with_tokens.__wrapped__(  # type: ignore[attr-defined]
+                    model, ids, voice_for_input
+                )
             
             # Make sure prediction is on the correct device
             if audio_pred.device != device:
@@ -315,14 +393,32 @@ def train(
             else:
                 freq_loss = torch.tensor(0.0, device=device)
             
+            # 4. Optional style regularization (KL/L2) to control variance
+            style_reg_loss = torch.tensor(0.0, device=device)
+            if style_regularization is not None and style_regularization > 0:
+                # L2 regularization on the style part of the embedding (second 128 values)
+                style_reg_loss = torch.norm(base_voice[0, 128:]) ** 2 * style_regularization
+            
             # Combine losses with appropriate weights
             # Higher weight on L1 ensures primary convergence
-            loss = l1_loss * 0.6 + mse_loss * 0.3 + freq_loss * 0.1
+            loss = l1_loss * 0.6 + mse_loss * 0.3 + freq_loss * 0.1 + style_reg_loss
 
             # -------------------- optimise -------------------------
-            optim.zero_grad()
+            # Gradient accumulation for memory efficiency
+            loss = loss / gradient_accumulation_steps
             loss.backward()
-            optim.step()
+            
+            # Only step optimizer after accumulating gradients
+            if batch_count % gradient_accumulation_steps == 0 or batch_count == len(loader):
+                optim.step()
+                optim.zero_grad()
+                
+                # Explicitly clean memory if needed
+                if memory_efficient and device.type == "mps" and batch_count % 5 == 0:
+                    # Release unused memory
+                    if hasattr(torch.mps, 'empty_cache'):
+                        torch.mps.empty_cache()
+                    gc.collect()
 
             epoch_loss += loss.item()
             # print current step statistics
@@ -334,23 +430,76 @@ def train(
                 writer.add_scalar('Batch/L1_Loss', l1_loss.item(), step)
                 writer.add_scalar('Batch/MSE_Loss', mse_loss.item(), step)
                 writer.add_scalar('Batch/Freq_Loss', freq_loss.item(), step)
+                if style_regularization is not None and style_regularization > 0:
+                    writer.add_scalar('Batch/Style_Reg_Loss', style_reg_loss.item(), step)
                 writer.add_scalar('Batch/Combined_Loss', loss.item(), step)
                 
             if use_wandb and WANDB_AVAILABLE:
-                wandb.log({
+                log_data = {
                     'batch_l1_loss': l1_loss.item(),
                     'batch_mse_loss': mse_loss.item(),
                     'batch_freq_loss': freq_loss.item(),
                     'batch_loss': loss.item(),
                     'step': step
-                })
+                }
+                if style_regularization is not None and style_regularization > 0:
+                    log_data['batch_style_reg_loss'] = style_reg_loss.item()
+                wandb.log(log_data)
 
         avg_loss = epoch_loss / len(loader)
-        print(f"Epoch {epoch:>3}/{epochs}: loss {avg_loss:.4f}")
+        
+        # Run validation if validation dataset is available
+        validation_loss = None
+        if validation_loader is not None:
+            model.eval()  # Set model to evaluation mode
+            val_losses = []
+            with torch.no_grad():
+                for val_text, val_target_log_mel in validation_loader:
+                    val_text = val_text[0]  # batch_size=1 for validation too
+                    val_target_log_mel = val_target_log_mel.to(device)
+                    
+                    # Process validation sample
+                    phonemes, _ = g2p.g2p(val_text)
+                    if phonemes is None or len(phonemes) == 0:
+                        continue
+                    
+                    # Convert phonemes to input IDs
+                    val_ids = text_to_input_ids(model, phonemes).to(device)
+                    if val_ids.shape[1] < 3:
+                        continue
+                    
+                    # Generate audio with current voice embedding
+                    val_audio_pred, _ = model.forward_with_tokens.__wrapped__(model, val_ids, base_voice)
+                    
+                    # Convert to mel spectrogram
+                    val_pred_mel = mel_transform(val_audio_pred)
+                    val_pred_log_mel = 20 * torch.log10(val_pred_mel.clamp(min=1e-5))
+                    
+                    # Ensure dimensions match and compute L1 loss
+                    if val_target_log_mel.dim() == 4:
+                        val_target_log_mel = val_target_log_mel.squeeze(0)
+                    if val_pred_log_mel.dim() == 2:
+                        val_pred_log_mel = val_pred_log_mel.unsqueeze(0)
+                    
+                    # Use minimum time dimension
+                    val_T = min(val_pred_log_mel.shape[-1], val_target_log_mel.shape[-1])
+                    val_loss = l1_loss_fn(val_pred_log_mel[..., :val_T], val_target_log_mel[..., :val_T])
+                    val_losses.append(val_loss.item())
+                    
+                if val_losses:
+                    validation_loss = sum(val_losses) / len(val_losses)
+                    print(f"Epoch {epoch:>3}/{epochs}: training loss {avg_loss:.4f}, validation loss {validation_loss:.4f}")
+                else:
+                    print(f"Epoch {epoch:>3}/{epochs}: training loss {avg_loss:.4f} (no validation samples processed)")
+            model.train()  # Set model back to training mode
+        else:
+            print(f"Epoch {epoch:>3}/{epochs}: loss {avg_loss:.4f}")
         
         # Log epoch metrics
         if writer is not None:
-            writer.add_scalar('Epoch/Loss', avg_loss, epoch)
+            writer.add_scalar('Epoch/Training_Loss', avg_loss, epoch)
+            if validation_loss is not None:
+                writer.add_scalar('Epoch/Validation_Loss', validation_loss, epoch)
             writer.add_scalar('Epoch/Learning_Rate', optim.param_groups[0]['lr'], epoch)
             
             # Log voice embedding stats
@@ -368,7 +517,7 @@ def train(
             writer.add_scalar('Voice/Style_Std', style_data.std(), epoch)
         
         if use_wandb and WANDB_AVAILABLE:
-            metrics = {
+            log_dict = {
                 'epoch': epoch,
                 'epoch_loss': avg_loss,
                 'learning_rate': optim.param_groups[0]['lr'],
@@ -377,7 +526,11 @@ def train(
                 'style_mean': base_voice[0, 128:].mean().item(),
                 'style_std': base_voice[0, 128:].std().item(),
             }
-            wandb.log(metrics)
+            
+            if validation_loss is not None:
+                log_dict['validation_loss'] = validation_loss
+                
+            wandb.log(log_dict)
             
             # Log histograms in W&B
             wandb.log({
@@ -437,26 +590,65 @@ def train(
                         wandb.log({f"spectrogram_epoch_{epoch}": wandb.Image(fig)})
                         plt.close(fig)
         
-        # Update scheduler based on validation loss
-        scheduler.step(avg_loss)
+        # Update scheduler based on validation loss if available, otherwise use training loss
+        if validation_loss is not None and lr_decay_schedule in [None, 'plateau']:
+            scheduler.step(validation_loss)  # Use validation loss for plateau scheduler
+        elif lr_decay_schedule == 'plateau':
+            scheduler.step(avg_loss)         # Use training loss for plateau if no validation
+        elif lr_decay_schedule in ['step', 'auto']:
+            scheduler.step()                 # Step scheduler automatically for step/auto
+        
+        # Monitor embedding statistics to potentially freeze timbre
+        current_timbre = base_voice[0, :128]
+        current_style = base_voice[0, 128:]
+        current_timbre_std = current_timbre.std().item()
+        current_style_std = current_style.std().item()
+        
+        # Check if we need to freeze timbre based on standard deviation threshold
+        if timbre_freeze_threshold is not None and current_timbre_std >= timbre_freeze_threshold:
+            if current_timbre.requires_grad:
+                print(f"Freezing timbre part of embedding (std={current_timbre_std:.4f} >= threshold={timbre_freeze_threshold:.4f})")
+                # Detach the timbre part of the voice embedding from the computation graph
+                base_voice.requires_grad_(False)
+                # Create a new tensor with only the style part requiring gradients
+                new_base_voice = torch.zeros_like(base_voice)
+                new_base_voice[0, :128] = base_voice[0, :128].detach().clone()  # Frozen timbre
+                new_base_voice[0, 128:] = base_voice[0, 128:].clone()          # Still trainable style
+                new_base_voice[0, 128:].requires_grad_(True)                   # Only update style now
+                
+                # Replace the old tensor and update optimizer
+                base_voice = new_base_voice
+                optim = torch.optim.Adam([{'params': base_voice[0, 128:]}], lr=optim.param_groups[0]['lr'], weight_decay=1e-6)
+                
+                # Update scheduler to track the new optimizer
+                if lr_decay_schedule is None or lr_decay_schedule == 'plateau':
+                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                        optim, mode='min', factor=lr_decay_rate, patience=5
+                    )
+                elif lr_decay_schedule == 'step':
+                    steps = lr_decay_epochs or [int(epochs * 0.3), int(epochs * 0.6), int(epochs * 0.8)]
+                    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                        optim, milestones=steps, gamma=lr_decay_rate
+                    )
+                elif lr_decay_schedule == 'auto':
+                    scheduler = torch.optim.lr_scheduler.StepLR(
+                        optim, step_size=5, gamma=lr_decay_rate
+                    )
         
         # Periodically normalize the voice tensor for better quality
         # This prevents drift and keeps voice characteristics appropriate
         if epoch % 25 == 0 and epoch > 0:
             with torch.no_grad():
-                # Normalize timbre and style components separately
-                current_timbre = base_voice[0, :128]
-                current_style = base_voice[0, 128:]
+                # Only normalize parts that aren't frozen
+                if base_voice[0, :128].requires_grad:  # If timbre isn't frozen
+                    current_timbre_mean = current_timbre.mean()
+                    # Adjust toward target statistics
+                    base_voice[0, :128] = ((current_timbre - current_timbre_mean) / current_timbre_std) * timbre_std + timbre_mean
                 
-                # Calculate current statistics
-                current_timbre_mean = current_timbre.mean()
-                current_timbre_std = current_timbre.std()
-                current_style_mean = current_style.mean()
-                current_style_std = current_style.std()
-                
-                # Adjust toward target statistics
-                base_voice[0, :128] = ((current_timbre - current_timbre_mean) / current_timbre_std) * timbre_std + timbre_mean
-                base_voice[0, 128:] = ((current_style - current_style_mean) / current_style_std) * style_std + style_mean
+                if base_voice[0, 128:].requires_grad:  # Style should always be trainable
+                    current_style_mean = current_style.mean()
+                    # Adjust toward target statistics
+                    base_voice[0, 128:] = ((current_style - current_style_mean) / current_style_std) * style_std + style_mean
                 
                 print(f"Normalized voice at epoch {epoch}:")
                 print(f"  Timbre: mean={base_voice[0, :128].mean().item():.4f}, std={base_voice[0, :128].std().item():.4f}")
@@ -467,18 +659,21 @@ def train(
             voice_embed[i, 0, :] = base_voice.clone()
         
         # Save the full voice tensor every 10 epochs
-        if epoch % 10 == 0:
-            save_voice(base_voice, voice_embed, f"{out.strip(".pt")}.epoch{epoch}.pt")
+        if epoch % 5 == 0:
+            # Create output directory if it doesn't exist
+            os.makedirs(f"{out}/{name}", exist_ok=True)
+            save_voice(base_voice, voice_embed, f"{out}/{name}/{name}.epoch{epoch}.pt")
         
 
-        # Optionally decay LR
-        if epoch % 50 == 0:
+        # Manual LR decay only if no scheduler is used
+        if lr_decay_schedule is None and epoch % 50 == 0:
             for g in optim.param_groups:
                 g["lr"] *= 0.5
-                print(f"Reducing LR to {g['lr']}")
+                print(f"Manually reducing LR to {g['lr']}")
     
     # Save the final voice tensor
-    save_voice(base_voice, voice_embed, out)
+    os.makedirs(f"{out}/{name}", exist_ok=True)
+    save_voice(base_voice, voice_embed, f"{out}/{name}/{name}.pt")
     
     # Close monitoring tools
     if writer is not None:
@@ -509,12 +704,41 @@ def save_voice(base_voice, voice_embed, out):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Import at top level to ensure they're available
+    import gc
+    
     ap = argparse.ArgumentParser(description="Train a Kokoro voice embedding")
     ap.add_argument("--data", type=str, help="Path to dataset directory")
     ap.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
     ap.add_argument("--batch-size", type=int, default=1, help="Batch size")
     ap.add_argument("--lr", type=float, default=1e-2, help="Learning rate")
-    ap.add_argument("--out", type=str, default="my_voice.pt", help="Output voice file")
+    ap.add_argument("--name", type=str, default="my_voice", help="Output voice file")
+    ap.add_argument("--out", type=str, default="output", help="Output directory")
+    ap.add_argument("--dataset-id", type=str,
+                help='HF dataset repo ID (e.g. "aimeri/my-voice-demo"). '
+                     'Used if --data is not given.')
+    # Add memory optimization arguments
+    memory_group = ap.add_argument_group('Memory Optimization')
+    memory_group.add_argument("--memory-efficient", action="store_true", help="Enable memory efficiency optimizations")
+    memory_group.add_argument("--grad-accumulation", type=int, default=1, 
+                             help="Number of batches to accumulate gradients over before optimizer step")
+    memory_group.add_argument("--mps-watermark", type=float, default=0.7, 
+                             help="MPS high watermark ratio (0.0-1.0) - lower values use less memory")
+    
+    # Add advanced training control arguments
+    training_group = ap.add_argument_group('Advanced Training Controls')
+    training_group.add_argument("--lr-decay", type=str, choices=['auto', 'step', 'plateau'], default='auto',
+                              help="Learning rate decay schedule. 'auto'=every 5 epochs, 'step'=at specific milestones, 'plateau'=when loss plateaus")
+    training_group.add_argument("--lr-decay-rate", type=float, default=0.5,
+                              help="Factor to multiply learning rate by when decaying (e.g., 0.5 = halve it)")
+    training_group.add_argument("--lr-decay-epochs", type=int, nargs='+',
+                              help="Epochs at which to decay learning rate (only for 'step' decay)")
+    training_group.add_argument("--timbre-freeze", type=float, default=None,
+                              help="Freeze timbre part of embedding when its std reaches this value (e.g., 0.5)")
+    training_group.add_argument("--style-reg", type=float, default=None,
+                              help="L2 regularization strength for style part of embedding (e.g., 1e-4)")
+    training_group.add_argument("--validation-samples", type=int, default=0,
+                              help="Number of samples to hold out for validation")
     
     # Add monitoring arguments
     monitoring_group = ap.add_argument_group('Monitoring')
@@ -525,17 +749,42 @@ if __name__ == "__main__":
     monitoring_group.add_argument("--wandb-name", type=str, help="W&B run name")
     monitoring_group.add_argument("--log-audio-every", type=int, default=10, help="Log audio samples every N epochs")
     args = ap.parse_args()
+    
+    data_root = args.data
+    if data_root is None:
+        if not args.dataset_id:
+            ap.error("Either --data or --dataset-id must be supplied")
+        print(f"Downloading dataset snapshot from hf://datasets/{args.dataset_id} …")
+        data_root = snapshot_download(
+            repo_id=args.dataset_id,
+            repo_type="dataset",
+            token=True,              # pick up cached token
+            ignore_patterns=["*.md"], # skip large README pre-renders, optional
+        )
 
+    # Create output directory structure
+    os.makedirs(f"{args.out}/{args.name}", exist_ok=True)
+    
     train(
-        data_root=args.data,
+        data_root=data_root,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         out=args.out,
+        name=args.name,
         use_tensorboard=args.tensorboard,
         use_wandb=args.wandb,
         wandb_project=args.wandb_project,
         wandb_name=args.wandb_name,
         log_audio_every=args.log_audio_every,
         log_dir=args.log_dir,
+        memory_efficient=args.memory_efficient,
+        gradient_accumulation_steps=args.grad_accumulation,
+        # Advanced training parameters
+        lr_decay_schedule=args.lr_decay,
+        lr_decay_rate=args.lr_decay_rate,
+        lr_decay_epochs=args.lr_decay_epochs,
+        timbre_freeze_threshold=args.timbre_freeze,
+        style_regularization=args.style_reg,
+        validation_set_size=args.validation_samples,
     )

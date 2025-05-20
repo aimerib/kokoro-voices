@@ -21,6 +21,41 @@ import re
 import random
 from pathlib import Path
 from tqdm import tqdm
+import shutil
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# Used when exporting to HuggingFace
+from huggingface_hub import HfApi, upload_folder, create_repo
+def upload_to_hf(dataset_dir: str, repo_id: str, private: bool = True, gated: bool = True):
+    """
+    Push an entire dataset directory to the Hugging Face Hub.
+
+    Args:
+        dataset_dir: local directory (prompts.txt + wavs)
+        repo_id: e.g. "aimeri/my-voice-demo"
+        private: create a private repo (recommended for gated datasets)
+        gated:   put the repo behind the Hub's "Access request" gate
+    """
+    api = HfApi()
+
+    # Create the repo if it doesn't exist yet
+    if not api.repo_exists(repo_id, repo_type="dataset"):
+        api.create_repo(
+            repo_id,
+            private=private,
+            repo_type="dataset",
+        )
+
+    print(f"Uploading {dataset_dir} → hf://datasets/{repo_id} …")
+    upload_folder(
+        repo_id=repo_id,
+        repo_type="dataset",
+        folder_path=dataset_dir,
+        commit_message="Add prepared dataset",
+    )
+    print("✓ upload complete")
 
 def transcribe(audio, model_name="base"):
     # Load Whisper model
@@ -154,17 +189,27 @@ def save_dataset(segments, output_dir, target_sr=24000):
     print(f"Created dataset with {len(seen_texts)} segments in {output_dir}")
 
 
-def prepare_dataset(input_file, output_dir, model_name="base", seed=1985):
+def prepare_dataset(input_path, output_dir, model_name="base", seed=1985):
     """
     End-to-end preparation of dataset from a long audio file
     
     Args:
-        input_file: Path to input audio file
+        input_path: Path to input audio file or folder
         output_dir: Directory to save dataset
         model_name: Whisper model size (tiny, base, small, medium, large)
         seed: Random seed for shuffling
     """
-    print(f"Processing {input_file}...")
+    print(f"Processing {input_path}...")
+
+    audio_to_process = []
+    segments = []
+
+    if os.path.isdir(input_path):
+        for file in os.listdir(input_path):
+            if file.endswith(".wav") or file.endswith(".mp3"):
+                audio_to_process.append(os.path.join(input_path, file))
+    else:
+        audio_to_process.append(input_path)
     
     # Set random seed
     random.seed(seed)
@@ -176,15 +221,13 @@ def prepare_dataset(input_file, output_dir, model_name="base", seed=1985):
     
     # Load audio file (Whisper expects 16kHz)
     print(f"Loading audio file...")
-    audio = load_audio(input_file, sr=16000)
-    
-    # Transcribe with Whisper
-    print(f"Transcribing audio (this may take a while)...")
-    result = transcribe(audio, model_name=model_name)
-    
-    # Get segments
-    print(f"Segmenting audio into chunks...")
-    segments = segment_audio(audio, 16000, result["segments"])
+    for i, audio_path in enumerate(audio_to_process):
+        audio = load_audio(audio_path, sr=16000)
+        
+        # Transcribe with Whisper
+        print(f"Transcribing audio {i+1}/{len(audio_to_process)} (this may take a while)...")
+        result = transcribe(audio, model_name=model_name)
+        segments.extend(segment_audio(audio, 16000, result["segments"]))
     
     # Shuffle segments to improve training diversity
     random.shuffle(segments)
@@ -201,16 +244,30 @@ def prepare_dataset(input_file, output_dir, model_name="base", seed=1985):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare a Kokoro voice dataset from a long audio recording")
-    parser.add_argument("--input", required=True, help="Input audio file path")
+    parser.add_argument("--input", required=True, help="Input audio file path or path to folder with audio files")
     parser.add_argument("--output", required=True, help="Output dataset directory")
-    parser.add_argument("--model", default="base", choices=["tiny", "base", "small", "medium", "large", "turbo"],
-                       help="Whisper model size (default: base)")
+    parser.add_argument("--model", default="base", choices=["tiny", "base", "small", "medium", "large", "turbo"], help="Whisper model size (default: base)")
     parser.add_argument("--seed", type=int, default=1985, help="Random seed for shuffling (default: 42)")
+    parser.add_argument("--upload-hf", action="store_true", help="After preparing, upload the dataset to Hugging Face")
+    parser.add_argument("--hf-repo", type=str, help='Target HF dataset repo (e.g. "aimeri/my-voice-demo")')
+    parser.add_argument("--hf-public", action="store_true", help="Create public repo (default: private)")
+    parser.add_argument("--cleanup-after-upload", action="store_true", help="Remove the dataset directory after uploading")
     args = parser.parse_args()
     
-    # Validate input file exists
+    # Validate input file or folder exists
     if not os.path.exists(args.input):
-        raise FileNotFoundError(f"Input file not found: {args.input}")
+        raise FileNotFoundError(f"Input file or folder not found: {args.input}")
     
+
     # Prepare dataset
     prepare_dataset(args.input, args.output, args.model, args.seed)
+    if args.upload_hf:
+        if not args.hf_repo:
+            raise ValueError("--upload-hf requires --hf-repo")
+        upload_to_hf(
+            dataset_dir=args.output,
+            repo_id=args.hf_repo,
+            private=not args.hf_public
+        )
+        if args.cleanup_after_upload:
+            shutil.rmtree(args.output)

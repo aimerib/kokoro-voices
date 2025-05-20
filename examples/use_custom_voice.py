@@ -86,7 +86,7 @@ if __name__ == "__main__":
     text = "The quick brown fox jumps over the lazy dog. This is a test of my custom voice for Kokoro."
     
     # Path to folder with voice checkpoints
-    voices_path = "/Users/aimeri/projects/kokoro/"
+    voices_path = "output/my_voice/"
     voice_name = "my_voice"
 
     # iterate over each .epoch*.pt file in the folder ignoring _compact.pt

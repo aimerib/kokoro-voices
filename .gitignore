@@ -6,4 +6,8 @@ output/*
 # Training artifacts
 wandb/
 *.pt
-*.tfevents.*
+runs/
+
+.env
+
+.DS_Store

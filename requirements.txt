@@ -16,3 +16,4 @@ tensorboard
 wandb
 
 tqdm
+python-dotenv
