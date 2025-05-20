@@ -33,6 +33,9 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import shutil
+import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional, Union, Dict, Any
 import random
@@ -47,7 +50,7 @@ from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
 import numpy as np
 
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, HfApi, upload_folder
 
 
 from dotenv import load_dotenv
@@ -231,6 +234,8 @@ def train(
     style_regularization: Optional[float] = 1e-3,   # L2 regularization on style part of embedding (default: 1e-3)
     skip_validation: bool = False,                  # Skip validation split
     save_best: bool = True,                        # Save best checkpoint (lowest validation L1 loss after epoch 5)
+    upload_to_hf: bool = False,                    # Upload model and artifacts to HuggingFace
+    hf_repo_id: Optional[str] = None,              # Repository ID for HuggingFace upload
 ):
     device = get_device()
     print(f"Using device: {device}")
@@ -797,6 +802,68 @@ def train(
         print(f"\nTraining complete. Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
         print(f"Best model saved to: {out}/{name}/{name}.best.pt")
     
+    # Upload to HuggingFace if requested
+    if upload_to_hf and hf_repo_id:
+        # Collect dataset statistics
+        total_samples = len(dataset)
+        total_duration = 0
+        
+        # Calculate approximate duration by loading a few samples
+        sample_count = min(10, total_samples)  # Sample up to 10 files to estimate duration
+        if sample_count > 0:
+            sample_indices = random.sample(range(total_samples), sample_count)
+            sample_durations = []
+            
+            for idx in sample_indices:
+                wav_path = dataset.wav_paths[idx]
+                info = torchaudio.info(wav_path)
+                sample_durations.append(info.num_frames / info.sample_rate)
+            
+            avg_duration = sum(sample_durations) / len(sample_durations)
+            total_duration = avg_duration * total_samples
+        else:
+            avg_duration = "Unknown"
+            total_duration = "Unknown"
+        
+        dataset_stats = {
+            "num_samples": total_samples,
+            "total_duration": f"{total_duration:.2f}" if isinstance(total_duration, float) else total_duration,
+            "avg_duration": f"{avg_duration:.2f}" if isinstance(avg_duration, float) else avg_duration,
+        }
+        
+        # Collect audio samples
+        audio_samples = {}
+        if use_wandb and WANDB_AVAILABLE:
+            # Find any saved audio files from wandb runs
+            for epoch in range(1, epochs + 1, log_audio_every):
+                sample_path = f"wandb/latest-run/files/media/audio/audio_sample_epoch_{epoch}_*.wav"
+                matches = list(Path().glob(sample_path))
+                if matches:
+                    audio_samples[epoch] = str(matches[0])
+        
+        # Collect training parameters
+        training_params = {
+            "lr": lr,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "n_mels": n_mels,
+            "n_fft": n_fft,
+            "hop": hop,
+            "style_regularization": style_regularization,
+            "timbre_freeze_threshold": timbre_freeze_threshold,
+            "hf_repo_id": hf_repo_id,
+        }
+        
+        # Upload to HuggingFace
+        upload_to_huggingface(
+            output_dir=out,
+            name=name,
+            best_epoch=best_epoch,
+            dataset_stats=dataset_stats,
+            training_params=training_params,
+            audio_samples=audio_samples
+        )
+    
     # Close monitoring tools
     if writer is not None:
         writer.close()
@@ -819,6 +886,135 @@ def save_voice(base_voice, voice_embed, out):
         # Save the full 3D tensor version
         torch.save({"voice": voice_embed.detach().cpu()}, save_path)
         print(f"Saved full voice tensor to {save_path.resolve()} – shape {tuple(voice_embed.shape)}")
+
+
+def upload_to_huggingface(output_dir, name, best_epoch, dataset_stats, training_params, audio_samples=None):
+    """
+    Upload trained voice model and artifacts to HuggingFace.
+    
+    Args:
+        output_dir: Local directory containing the voice model and artifacts
+        name: Name of the voice model
+        best_epoch: Best epoch number (for README)
+        dataset_stats: Statistics about the dataset used for training
+        training_params: Parameters used for training
+        audio_samples: Dictionary mapping epoch numbers to audio sample files
+    """
+    if not training_params.get("hf_repo_id"):
+        print("No HuggingFace repository ID provided. Skipping upload.")
+        return
+    
+    repo_id = training_params["hf_repo_id"]
+    print(f"\nPreparing to upload voice model and artifacts to HuggingFace: {repo_id}")
+    
+    # Create a temporary directory for organizing the HF repo contents
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        
+        # 1. Create the main model file (renamed to just name.pt)
+        best_model_path = Path(output_dir) / name / f"{name}.best.pt"
+        if best_model_path.exists():
+            shutil.copy(best_model_path, tmp_path / f"{name}.pt")
+        else:
+            # Fallback to the final model if best doesn't exist
+            final_model_path = Path(output_dir) / name / f"{name}.pt"
+            shutil.copy(final_model_path, tmp_path / f"{name}.pt")
+        
+        # 2. Create 'rejects' directory with all other checkpoints
+        rejects_dir = tmp_path / "rejects"
+        rejects_dir.mkdir(exist_ok=True)
+        
+        # Copy all epoch checkpoints to rejects
+        for checkpoint in (Path(output_dir) / name).glob(f"{name}.epoch*.pt"):
+            shutil.copy(checkpoint, rejects_dir / checkpoint.name)
+        
+        # 3. Copy audio samples if available
+        if audio_samples:
+            samples_dir = tmp_path / "samples"
+            samples_dir.mkdir(exist_ok=True)
+            
+            for epoch, sample_path in audio_samples.items():
+                if os.path.exists(sample_path):
+                    shutil.copy(sample_path, samples_dir / f"epoch_{epoch}.wav")
+        
+        # 4. Create README.md with model information
+        create_readme(tmp_path, name, best_epoch, dataset_stats, training_params)
+        
+        # 5. Upload to HuggingFace
+        print(f"Uploading files to HuggingFace repository: {repo_id}")
+        upload_folder(
+            folder_path=tmp_dir,
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=f"Upload {name} voice model and artifacts"
+        )
+        
+        print(f"Successfully uploaded voice model to HuggingFace: https://huggingface.co/{repo_id}")
+
+
+def create_readme(output_dir, name, best_epoch, dataset_stats, training_params):
+    """
+    Create a README.md file with information about the voice model.
+    
+    Args:
+        output_dir: Directory to save the README.md file
+        name: Name of the voice model
+        best_epoch: Best epoch number
+        dataset_stats: Statistics about the dataset used for training
+        training_params: Parameters used for training
+    """
+    # Format the current date and time
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    
+    # Create README content
+    readme_content = f"""# {name} - Kokoro Voice Model
+
+## Model Information
+- **Created:** {current_date}
+- **Name:** {name}
+- **Best Epoch:** {best_epoch}
+
+## Dataset Information
+- **Audio Samples:** {dataset_stats.get('num_samples', 'N/A')}
+- **Total Duration:** {dataset_stats.get('total_duration', 'N/A')} seconds
+- **Average Sample Duration:** {dataset_stats.get('avg_duration', 'N/A')} seconds
+
+## Training Parameters
+- **Learning Rate:** {training_params.get('lr', 'N/A')}
+- **Epochs:** {training_params.get('epochs', 'N/A')}
+- **Batch Size:** {training_params.get('batch_size', 'N/A')}
+- **Mel Bins:** {training_params.get('n_mels', 'N/A')}
+- **FFT Size:** {training_params.get('n_fft', 'N/A')}
+- **Hop Length:** {training_params.get('hop', 'N/A')}
+- **Style Regularization:** {training_params.get('style_regularization', 'N/A')}
+- **Timbre Freeze Threshold:** {training_params.get('timbre_freeze_threshold', 'N/A')}
+
+## Usage
+
+```python
+import torch
+from kokoro import KPipeline
+
+# Load the voice model
+voice = torch.load("{name}.pt")["voice"]
+
+# Initialize the pipeline
+pipeline = KPipeline(voice=voice)
+
+# Generate speech
+audio = pipeline("Hello, world!")
+```
+
+## Model Structure
+This model consists of a 256-dimensional voice embedding with:
+- 128 dimensions for timbre (voice characteristics)
+- 128 dimensions for style (expressivity/prosody)
+
+"""
+    
+    # Write the README.md file
+    with open(output_dir / "README.md", "w") as f:
+        f.write(readme_content)
         
 
 # ---------------------------------------------------------------------------
@@ -870,6 +1066,11 @@ if __name__ == "__main__":
     monitoring_group.add_argument("--wandb-project", type=str, help="W&B project name")
     monitoring_group.add_argument("--wandb-name", type=str, help="W&B run name")
     monitoring_group.add_argument("--log-audio-every", type=int, default=10, help="Log audio samples every N epochs")
+    
+    # Add HuggingFace upload arguments
+    hf_group = ap.add_argument_group('HuggingFace Upload')
+    hf_group.add_argument("--upload-to-hf", action="store_true", help="Upload model and artifacts to HuggingFace")
+    hf_group.add_argument("--hf-repo-id", type=str, help="HuggingFace repository ID (e.g., 'username/model-name')")
     args = ap.parse_args()
     
     data_root = args.data
@@ -909,4 +1110,7 @@ if __name__ == "__main__":
         timbre_freeze_threshold=args.timbre_freeze,
         style_regularization=args.style_reg,
         skip_validation=args.skip_validation,
+        # HuggingFace upload
+        upload_to_hf=args.upload_to_hf,
+        hf_repo_id=args.hf_repo_id,
     )
