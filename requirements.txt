@@ -2,6 +2,7 @@ torch
 numpy
 matplotlib
 huggingface_hub
+pip # For kokoro
 
 torchaudio
 soundfile
@@ -17,3 +18,6 @@ wandb
 
 tqdm
 python-dotenv
+
+phonemizer-fork
+inflect

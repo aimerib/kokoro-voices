@@ -10,8 +10,15 @@ This script follows the guidance in the Kokoro research doc:
 Expected dataset layout
 ----------------------
 <dataset>/
-    prompts.txt       # tab-separated: <wav_filename> \t <sentence>
-    *.wav             # mono wavs (~24 kHz). Any sample-rate is accepted and resampled.
+    train/           # Training data 
+        metadata.jsonl   # JSON Lines format: {"file_name": "segment_0000.wav", "text": "<sentence>"}
+        segment_*.wav    # Audio files
+    validation/      # Validation data (optional)
+        metadata.jsonl   # Same format as train
+        segment_*.wav    # Audio files
+    test/            # Test data (optional)
+        metadata.jsonl   # Same format as train
+        segment_*.wav    # Audio files
 
 Usage
 -----
@@ -29,11 +36,14 @@ import os
 from pathlib import Path
 from typing import List, Tuple, Optional, Union, Dict, Any
 import random
+import json
+import gc
 
 import torch
 import torchaudio
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -66,35 +76,69 @@ def get_device() -> torch.device:
         return torch.device("cuda")
     return torch.device("cpu")
 
+def pad_sequence_to_length(sequence, target_length, pad_value=0):
+    """Pad a single tensor to a specific length along the last dimension."""
+    pad_size = target_length - sequence.shape[-1]
+    if pad_size <= 0:
+        return sequence
+    # Only pad the last dimension on the right side
+    padded = torch.nn.functional.pad(sequence, (0, pad_size), value=pad_value)
+    return padded
+
+def dynamic_time_truncation(mel_spec1, mel_spec2):
+    """Truncate two mel spectrograms to the same length (minimum of both)."""
+    min_time = min(mel_spec1.shape[-1], mel_spec2.shape[-1])
+    return mel_spec1[..., :min_time], mel_spec2[..., :min_time]
+
 
 class VoiceDataset(Dataset):
     """Loads (<sentence>, log-mel target) pairs for training."""
 
-    def __init__(self, root: str | Path, mel_transform: nn.Module, target_sr: int = 24_000, device=None):
+    def __init__(self, root: str | Path, mel_transform: nn.Module, target_sr: int = 24_000, device=None, split="train"):
         self.device = device or torch.device("cpu")
         self.root = Path(root)
         self.sentences: List[str] = []
         self.wav_paths: List[Path] = []
         self.mel_transform = mel_transform
         self.target_sr = target_sr
+        self.split = split
 
-        prompts = self.root / "prompts.txt"
-        if not prompts.exists():
-            raise FileNotFoundError(f"{prompts} not found – expected prompts.txt in dataset directory")
-
-        with prompts.open() as f:
-            for i, line in enumerate(f):
-                # if i >= 60:
-                #     break
-                line = line.strip()
-                if not line:
+        # Load from the specified split directory (default: train)
+        split_dir = self.root / split
+        metadata = split_dir / "metadata.jsonl"
+        
+        if not split_dir.exists():
+            raise FileNotFoundError(f"{split_dir} not found – expected split directory '{split}' in dataset root")
+            
+        if not metadata.exists():
+            raise FileNotFoundError(f"{metadata} not found – expected metadata.jsonl in {split} directory")
+        
+        self._load_metadata_file(metadata, split_dir)
+    
+    def _load_metadata_file(self, metadata_path, split_dir):
+        """Load entries from a metadata.jsonl file"""
+        with open(metadata_path) as f:
+            for line in f:
+                if not line.strip():
                     continue
-                wav_name, text = line.split("\t", 1)
-                wav_path = self.root / wav_name
-                if not wav_path.exists():
-                    raise FileNotFoundError(f"Missing WAV file: {wav_path}")
-                self.wav_paths.append(wav_path)
-                self.sentences.append(text)
+                    
+                try:
+                    entry = json.loads(line)
+                    filename = entry["file_name"]
+                    text = entry["text"]
+                    
+                    # Path is relative to the split directory
+                    wav_path = split_dir / filename
+                    
+                    if not wav_path.exists():
+                        raise FileNotFoundError(f"Missing WAV file: {wav_path}")
+                    
+                    self.wav_paths.append(wav_path)
+                    self.sentences.append(text)
+                except json.JSONDecodeError:
+                    print(f"Warning: Skipping invalid JSON line: {line[:50]}...")
+                except KeyError as e:
+                    print(f"Warning: Skipping entry missing required field {e}: {line[:50]}...")
 
     def __len__(self) -> int:  # noqa: D401
         return len(self.sentences)
@@ -155,7 +199,7 @@ def train(
     lr_decay_epochs: List[int] = None,             # For 'step' schedule, epochs to decay
     timbre_freeze_threshold: Optional[float] = None, # Freeze timbre embedding when std reaches this value
     style_regularization: Optional[float] = None,   # L2 regularization on style part of embedding
-    validation_set_size: int = 0,                  # Number of samples to hold out for validation
+    skip_validation: bool = False,                  # Skip validation split
 ):
     device = get_device()
     print(f"Using device: {device}")
@@ -211,31 +255,36 @@ def train(
     dataset = VoiceDataset(data_root, mel_transform_cpu)
     
     # Split into training and validation sets if validation set size is specified
+    # Simply use the existing train/validation splits directly
+    dataset = VoiceDataset(data_root, mel_transform_cpu, split="train")
     validation_dataset = None
-    if validation_set_size > 0 and validation_set_size < len(dataset):
-        # Create indices for the split
-        indices = list(range(len(dataset)))
-        random.shuffle(indices)
-        val_indices = indices[:validation_set_size]
-        train_indices = indices[validation_set_size:]
-        
-        # Create a copy of the dataset for validation
-        # This way we keep the same dataset class but access different samples
-        validation_dataset = VoiceDataset(data_root, mel_transform_cpu)
-        validation_dataset.sentences = [dataset.sentences[i] for i in val_indices]
-        validation_dataset.wav_paths = [dataset.wav_paths[i] for i in val_indices]
-        
-        # Update training dataset to exclude validation samples
-        dataset.sentences = [dataset.sentences[i] for i in train_indices]
-        dataset.wav_paths = [dataset.wav_paths[i] for i in train_indices]
-        
-        print(f"Split dataset: {len(dataset)} training samples, {len(validation_dataset)} validation samples")
     
-    # Create data loaders
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # If validation directory exists and we requested validation data, load it
+    if not skip_validation and (Path(data_root) / "validation").exists():
+        validation_dataset = VoiceDataset(data_root, mel_transform_cpu, split="validation")
+        print(f"Using dataset splits: {len(dataset)} training samples, {len(validation_dataset)} validation samples")
+    
+    # Create data loaders - simpler configuration
+    loader = DataLoader(
+        dataset, 
+        batch_size=1,  # Always use batch_size of 1 for stability
+        shuffle=True
+    )
     validation_loader = None
     if validation_dataset:
-        validation_loader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=False)
+        validation_loader = DataLoader(
+            validation_dataset, 
+            batch_size=1,
+            shuffle=False
+        )
+        
+    # Effective batch size through gradient accumulation
+    # This provides the benefits of larger batches without memory issues
+    effective_batch_size = batch_size
+    if effective_batch_size > 1:
+        print(f"Using effective batch size of {effective_batch_size} through gradient accumulation")
+        # Update gradient_accumulation_steps to match the requested batch size
+        gradient_accumulation_steps = effective_batch_size
 
     # ---------------------------------------------------------------------
     # Model + voice embedding
@@ -332,11 +381,12 @@ def train(
             
         for text, target_log_mel in loader:
             batch_count += 1
+            
+            # Process single sample (we're always using batch_size=1 for stability)
             text = text[0]  # batch_size=1
             target_log_mel = target_log_mel.to(device)
-            # Dataset now consistently returns (1, n_mels, T) shape
-
-            # -------------------- prepare inputs --------------------
+            
+            # Process the text input
             phonemes, _ = g2p.g2p(text)
             if phonemes is None or len(phonemes) == 0:
                 continue  # skip un-tokenisable utterance
@@ -351,9 +401,6 @@ def train(
 
             # Here's the problem - when accessing a specific voice based on phoneme length,
             # we need to make sure base_voice matches the expected shape for the model
-            
-            # We need to ensure voice_for_input is [B, 256], not [1, 1, 256]
-            # In this case, B=1 (batch size)
             voice_for_input = base_voice  # Already [1, 256] and requires_grad=True
                 
             # Forward pass – call the *undecorated* version to retain gradients
@@ -371,29 +418,30 @@ def train(
             pred_log_mel = 20 * torch.log10(pred_log_mel.clamp(min=1e-5))
             # Shape will be [1, n_mels, T]
 
-            # Make sure dimensions match - DataLoader might add an extra batch dim
-            # Standardize both to 3D tensors [batch, n_mels, time]
+            # Standardize to 3D tensors [batch, n_mels, time] for consistent processing
             if target_log_mel.dim() == 4:  # [1, 1, n_mels, T]
-                target_log_mel = target_log_mel.squeeze(0)  # -> [1, n_mels, T]
+                target_for_loss = target_log_mel.squeeze(0)  # -> [1, n_mels, T]
+            else:
+                target_for_loss = target_log_mel
             
             if pred_log_mel.dim() == 2:  # [n_mels, T]
                 pred_log_mel = pred_log_mel.unsqueeze(0)  # -> [1, n_mels, T]
             
-            # Align time dimension
-            T = min(pred_log_mel.shape[-1], target_log_mel.shape[-1])
+            # Use the dynamic truncation helper for cleaner code
+            pred_for_loss, target_for_loss = dynamic_time_truncation(pred_log_mel, target_for_loss)
             
             # Multiple loss components for better learning
             # 1. L1 loss on mel-spectrogram (primary loss)
-            l1_loss = l1_loss_fn(pred_log_mel[..., :T], target_log_mel[..., :T])
+            l1_loss = l1_loss_fn(pred_for_loss, target_for_loss)
             
             # 2. MSE loss for spectral contour
-            mse_loss = mse_loss_fn(pred_log_mel[..., :T], target_log_mel[..., :T])
+            mse_loss = mse_loss_fn(pred_for_loss, target_for_loss)
             
             # 3. High-frequency emphasis loss - focus on important details
             # Calculate gradients in frequency domain (approximate gradients across mel bands)
-            if pred_log_mel.shape[1] > 1:  # Need at least 2 mel bands
-                pred_diff = pred_log_mel[:, 1:, :T] - pred_log_mel[:, :-1, :T]
-                target_diff = target_log_mel[:, 1:, :T] - target_log_mel[:, :-1, :T]
+            if pred_for_loss.shape[1] > 1:  # Need at least 2 mel bands
+                pred_diff = pred_for_loss[:, 1:] - pred_for_loss[:, :-1]
+                target_diff = target_for_loss[:, 1:] - target_for_loss[:, :-1]
                 freq_loss = l1_loss_fn(pred_diff, target_diff) * 0.5
             else:
                 freq_loss = torch.tensor(0.0, device=device)
@@ -408,12 +456,12 @@ def train(
             # Higher weight on L1 ensures primary convergence
             loss = l1_loss * 0.6 + mse_loss * 0.3 + freq_loss * 0.1 + style_reg_loss
 
-            # -------------------- optimise -------------------------
-            # Gradient accumulation for memory efficiency
+            # -------------------- optimize using gradient accumulation -------------------------
+            # Scale the loss by the accumulation steps to maintain the same gradients
             loss = loss / gradient_accumulation_steps
             loss.backward()
             
-            # Only step optimizer after accumulating gradients
+            # Only step optimizer after accumulating gradients from multiple samples
             if batch_count % gradient_accumulation_steps == 0 or batch_count == len(loader):
                 optim.step()
                 optim.zero_grad()
@@ -425,9 +473,9 @@ def train(
                         torch.mps.empty_cache()
                     gc.collect()
 
-            epoch_loss += loss.item()
+            epoch_loss += loss.item() * gradient_accumulation_steps  # Scale back for reporting
             # print current step statistics
-            print(f"{text[:20]}: loss {loss.item():.4f} - {len(phonemes)} phonemes - epoch loss {epoch_loss:.4f}")
+            print(f"{text[:20]}: loss {loss.item() * gradient_accumulation_steps:.4f} - {len(phonemes)} phonemes - epoch loss {epoch_loss:.4f}")
             
             # Log individual losses for current batch
             step = (epoch - 1) * len(loader) + loader.batch_size
@@ -460,10 +508,11 @@ def train(
             val_losses = []
             with torch.no_grad():
                 for val_text, val_target_log_mel in validation_loader:
+                    # Process the validation sample
                     val_text = val_text[0]  # batch_size=1 for validation too
                     val_target_log_mel = val_target_log_mel.to(device)
                     
-                    # Process validation sample
+                    # Process text
                     phonemes, _ = g2p.g2p(val_text)
                     if phonemes is None or len(phonemes) == 0:
                         continue
@@ -480,15 +529,20 @@ def train(
                     val_pred_mel = mel_transform(val_audio_pred)
                     val_pred_log_mel = 20 * torch.log10(val_pred_mel.clamp(min=1e-5))
                     
-                    # Ensure dimensions match and compute L1 loss
+                    # Standardize dimensions
                     if val_target_log_mel.dim() == 4:
-                        val_target_log_mel = val_target_log_mel.squeeze(0)
-                    if val_pred_log_mel.dim() == 2:
-                        val_pred_log_mel = val_pred_log_mel.unsqueeze(0)
+                        val_target_for_loss = val_target_log_mel.squeeze(0)
+                    else:
+                        val_target_for_loss = val_target_log_mel
                     
-                    # Use minimum time dimension
-                    val_T = min(val_pred_log_mel.shape[-1], val_target_log_mel.shape[-1])
-                    val_loss = l1_loss_fn(val_pred_log_mel[..., :val_T], val_target_log_mel[..., :val_T])
+                    if val_pred_log_mel.dim() == 2:  # [n_mels, T]
+                        val_pred_log_mel = val_pred_log_mel.unsqueeze(0)  # -> [1, n_mels, T]
+                    
+                    # Use dynamic truncation for cleaner code
+                    val_pred_for_loss, val_target_for_loss = dynamic_time_truncation(val_pred_log_mel, val_target_for_loss)
+                    
+                    # Compute loss
+                    val_loss = l1_loss_fn(val_pred_for_loss, val_target_for_loss)
                     val_losses.append(val_loss.item())
                     
                 if val_losses:
@@ -604,19 +658,27 @@ def train(
         current_timbre_std = current_timbre.std().item()
         current_style_std = current_style.std().item()
         
-        # Check if we need to freeze timbre based on standard deviation threshold
         if (timbre_freeze_threshold is not None
                 and current_timbre_std >= timbre_freeze_threshold
-                and base_voice[0, :128].requires_grad):
-            print(f"Freezing timbre (std={current_timbre_std:.3f})")
-            base_voice[0, :128].requires_grad_(False)
+                and base_voice.requires_grad):
 
-            # Remove timbre slice from the optimiser’s param list
-            optim = torch.optim.Adam(
-                [{'params': base_voice[0, 128:]}],
-                lr=optim.param_groups[0]['lr'],
-                weight_decay=1e-6
-            )
+            print(f"Freezing timbre at std={current_timbre_std:.3f}")
+
+            # 1.  Grab constant timbre part
+            frozen_timbre = base_voice[0, :128].detach()     # (128,)
+            # 2.  Create a *new* leaf Parameter for style
+            style_param   = nn.Parameter(base_voice[0, 128:].detach())  # (128,)
+            # 3.  Re-assemble 256-dim voice each forward pass
+            def get_voice():
+                return torch.cat([frozen_timbre, style_param]).unsqueeze(0)  # (1,256)
+
+            base_voice = get_voice()           # first call
+            voice_getter = get_voice           # keep for later reuse
+
+            # 4.  Re-initialise optimizer to track only style_param
+            optim = torch.optim.Adam([style_param], lr=optim.param_groups[0]['lr'],
+                                    weight_decay=1e-6)
+            voice_for_input = voice_getter()
         
         # Periodically normalize the voice tensor for better quality
         # This prevents drift and keeps voice characteristics appropriate
@@ -714,8 +776,8 @@ if __name__ == "__main__":
                               help="Freeze timbre part of embedding when its std reaches this value (e.g., 0.5)")
     training_group.add_argument("--style-reg", type=float, default=None,
                               help="L2 regularization strength for style part of embedding (e.g., 1e-4)")
-    training_group.add_argument("--validation-samples", type=int, default=0,
-                              help="Number of samples to hold out for validation")
+    training_group.add_argument("--skip-validation", type=bool, default=False,
+                              help="Skip validation split (default: False)")
     
     # Add monitoring arguments
     monitoring_group = ap.add_argument_group('Monitoring')
@@ -763,5 +825,5 @@ if __name__ == "__main__":
         lr_decay_epochs=args.lr_decay_epochs,
         timbre_freeze_threshold=args.timbre_freeze,
         style_regularization=args.style_reg,
-        validation_set_size=args.validation_samples,
+        skip_validation=args.skip_validation,
     )
