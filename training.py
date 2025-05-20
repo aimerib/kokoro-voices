@@ -486,7 +486,8 @@ def train(
             loss = loss / gradient_accumulation_steps
             loss.backward()
             
-            torch.nn.utils.clip_grad_norm_([base_voice], 1.0)
+            # Clip gradients of the *actual* trainable parameters (may change after timbre freeze)
+            torch.nn.utils.clip_grad_norm_(optim.param_groups[0]['params'], 1.0)
 
             # Only step optimizer after accumulating gradients from multiple samples
             if batch_count % gradient_accumulation_steps == 0 or batch_count == len(loader):
@@ -843,14 +844,12 @@ def save_voice(base_voice, voice_embed, out):
     # ---------------------------------------------------------------------
     save_path = Path(out)
     
-    # Save both the full voice tensor and the compact version
     with torch.no_grad():
         # Update the full tensor one last time
         for i in range(MAX_PHONEME_LEN):
             voice_embed[i, 0, :] = base_voice.clone()
         
-        # Save the full 3D tensor version
-        torch.save({"voice": voice_embed.detach().cpu()}, save_path)
+        torch.save(voice_embed.detach().cpu(), save_path)
         print(f"Saved full voice tensor to {save_path.resolve()} – shape {tuple(voice_embed.shape)}")
 
 
@@ -962,7 +961,7 @@ import torch
 from kokoro import KPipeline
 
 # Load the voice model
-voice = torch.load("{name}.pt")["voice"]
+voice = torch.load("{name}.pt")
 
 # Initialize the pipeline
 pipeline = KPipeline(voice=voice)
