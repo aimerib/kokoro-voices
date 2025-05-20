@@ -240,7 +240,8 @@ def train(
     # ---------------------------------------------------------------------
     # Model + voice embedding
     # ---------------------------------------------------------------------
-    model = KModel().to(device).eval()
+    # model = KModel().to(device).eval()
+    model = KModel().to(device).train()
     for p in model.parameters():
         p.requires_grad_(False)
 
