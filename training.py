@@ -358,7 +358,7 @@ def train(
     #     )
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optim, mode='min', factor=0.5, patience=8, min_lr=5e-5
+        optim, mode='min', factor=0.5, patience=3, min_lr=5e-5
     )
     
     # Multiple loss functions for better results
@@ -463,6 +463,7 @@ def train(
             
             # Only step optimizer after accumulating gradients from multiple samples
             if batch_count % gradient_accumulation_steps == 0 or batch_count == len(loader):
+                torch.nn.utils.clip_grad_norm_([base_voice], 1.0)
                 optim.step()
                 optim.zero_grad()
                 
