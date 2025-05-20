@@ -453,22 +453,13 @@ def train(
             if audio_pred.device != device:
                 audio_pred = audio_pred.to(device)
                 
-            # Get the original audio for the target from the dataset
-            target_wav = torch.tensor(dataset._load_wav(dataset.wav_paths[idx]), device=device)
-            
-            # Apply RMS normalization to both prediction and target audio
+            # Normalize the predicted audio to a constant RMS before Mel conversion
             normalized_pred = rms_normalize(audio_pred)
-            normalized_target = rms_normalize(target_wav)
-                
-            # audio_pred is (1, samples) - transform it to spectrogram using device-specific transform
+            
+            # Convert prediction to log-mel spectrogram
             pred_log_mel = mel_transform(normalized_pred)
             pred_log_mel = 20 * torch.log10(pred_log_mel.clamp(min=1e-5))
             
-            # Re-compute target log_mel from the normalized target audio
-            target_mel = mel_transform(normalized_target.unsqueeze(0))
-            target_log_mel = 20 * torch.log10(target_mel.clamp(min=1e-5)).unsqueeze(0)
-            # Shape will be [1, n_mels, T]
-
             # Standardize to 3D tensors [batch, n_mels, time] for consistent processing
             if target_log_mel.dim() == 4:  # [1, 1, n_mels, T]
                 target_for_loss = target_log_mel.squeeze(0)  # -> [1, n_mels, T]
@@ -578,23 +569,12 @@ def train(
                     # Generate audio
                     val_audio_pred, _ = model.forward_with_tokens.__wrapped__(model, val_ids, base_voice)
                     
-                    # Get the original audio for the target from the validation dataset
-                    val_idx = val_loader.batch_sampler.sampler.data_source.wav_paths.index(
-                        validation_dataset.wav_paths[validation_loader.batch_sampler.sampler.indices[0]])
-                    val_target_wav = torch.tensor(validation_dataset._load_wav(validation_dataset.wav_paths[val_idx]), 
-                                                 device=device)
-                    
-                    # Apply RMS normalization to both prediction and target audio
+                    # Normalize prediction before Mel conversion
                     val_normalized_pred = rms_normalize(val_audio_pred)
-                    val_normalized_target = rms_normalize(val_target_wav)
                     
                     # Convert to mel spectrogram
                     val_pred_mel = mel_transform(val_normalized_pred)
                     val_pred_log_mel = 20 * torch.log10(val_pred_mel.clamp(min=1e-5))
-                    
-                    # Re-compute target log_mel from the normalized target audio
-                    val_target_mel = mel_transform(val_normalized_target.unsqueeze(0))
-                    val_target_log_mel = 20 * torch.log10(val_target_mel.clamp(min=1e-5)).unsqueeze(0)
                     
                     # Standardize dimensions
                     if val_target_log_mel.dim() == 4:
@@ -855,6 +835,7 @@ def train(
         }
         
         # Upload to HuggingFace
+        print(f"Uploading files to HuggingFace repository: {hf_repo_id}")
         upload_to_huggingface(
             output_dir=out,
             name=name,
@@ -863,13 +844,16 @@ def train(
             training_params=training_params,
             audio_samples=audio_samples
         )
-    
-    # Close monitoring tools
+        
+        print(f"Successfully uploaded voice model to HuggingFace: https://huggingface.co/{hf_repo_id}")
+
+    # Close monitoring tools (always run)
     if writer is not None:
         writer.close()
-        
+    
     if use_wandb and WANDB_AVAILABLE:
         wandb.finish()
+
 
 def save_voice(base_voice, voice_embed, out):
     # ---------------------------------------------------------------------
@@ -1010,6 +994,7 @@ This model consists of a 256-dimensional voice embedding with:
 - 128 dimensions for timbre (voice characteristics)
 - 128 dimensions for style (expressivity/prosody)
 
+The model was trained using RMS-normalized audio to improve mel-spectrogram loss correlation with intelligibility.
 """
     
     # Write the README.md file
