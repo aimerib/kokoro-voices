@@ -595,13 +595,8 @@ def train(
                         wandb.log({f"spectrogram_epoch_{epoch}": wandb.Image(fig)})
                         plt.close(fig)
         
-        # Update scheduler based on validation loss if available, otherwise use training loss
-        if validation_loss is not None and lr_decay_schedule in [None, 'plateau']:
-            scheduler.step(validation_loss)  # Use validation loss for plateau scheduler
-        elif lr_decay_schedule == 'plateau':
-            scheduler.step(avg_loss)         # Use training loss for plateau if no validation
-        elif lr_decay_schedule in ['step', 'auto']:
-            scheduler.step()                 # Step scheduler automatically for step/auto
+        metric_for_scheduler = validation_loss if validation_loss is not None else avg_loss
+        scheduler.step(metric_for_scheduler)
         
         # Monitor embedding statistics to potentially freeze timbre
         current_timbre = base_voice[0, :128]
