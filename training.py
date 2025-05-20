@@ -91,6 +91,36 @@ def dynamic_time_truncation(mel_spec1, mel_spec2):
     return mel_spec1[..., :min_time], mel_spec2[..., :min_time]
 
 
+def rms_normalize(audio, target_rms=0.1):
+    """Normalize audio to target RMS value.
+    
+    Args:
+        audio: Audio tensor [batch, samples] or [samples]
+        target_rms: Target RMS value to normalize to
+        
+    Returns:
+        RMS-normalized audio of same shape
+    """
+    # Ensure audio is 2D with batch dimension
+    is_1d = audio.dim() == 1
+    if is_1d:
+        audio = audio.unsqueeze(0)
+        
+    # Calculate current RMS values
+    rms = torch.sqrt(torch.mean(audio ** 2, dim=-1, keepdim=True))
+    
+    # Normalize to target RMS (avoid division by zero)
+    eps = 1e-8
+    scaling_factor = target_rms / (rms + eps)
+    normalized = audio * scaling_factor
+    
+    # Return same dimensions as input
+    if is_1d:
+        normalized = normalized.squeeze(0)
+        
+    return normalized
+
+
 class VoiceDataset(Dataset):
     """Loads (<sentence>, log-mel target) pairs for training."""
 
@@ -179,7 +209,7 @@ def train(
     data_root: str | Path,
     epochs: int = 200,
     batch_size: int = 1,
-    lr: float = 1e-2,
+    lr: float = 5e-4,  # Reduced default learning rate (5-10x lower than original)
     out: str = "output",
     name: str = "my_voice",
     n_mels: int = 80,
@@ -197,9 +227,10 @@ def train(
     lr_decay_schedule: Optional[str] = None,       # 'auto', 'step', or 'plateau'
     lr_decay_rate: float = 0.5,                    # Factor to multiply LR when decaying
     lr_decay_epochs: List[int] = None,             # For 'step' schedule, epochs to decay
-    timbre_freeze_threshold: Optional[float] = None, # Freeze timbre embedding when std reaches this value
-    style_regularization: Optional[float] = None,   # L2 regularization on style part of embedding
+    timbre_freeze_threshold: Optional[float] = 0.25, # Freeze timbre embedding when std reaches this value (default: 0.25)
+    style_regularization: Optional[float] = 1e-3,   # L2 regularization on style part of embedding (default: 1e-3)
     skip_validation: bool = False,                  # Skip validation split
+    save_best: bool = True,                        # Save best checkpoint (lowest validation L1 loss after epoch 5)
 ):
     device = get_device()
     print(f"Using device: {device}")
@@ -340,6 +371,10 @@ def train(
     # Set up optimizer with weight decay for regularization
     optim = torch.optim.Adam([base_voice], lr=lr, weight_decay=1e-6)
     
+    # Track best validation loss for saving best checkpoint
+    best_val_loss = float('inf')
+    best_epoch = 0
+    
     # # Learning rate scheduling based on specified policy
     # if lr_decay_schedule is None or lr_decay_schedule == 'plateau':
     #     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -357,8 +392,8 @@ def train(
     #         optim, step_size=5, gamma=lr_decay_rate  # Decay every 5 epochs
     #     )
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optim, mode='min', factor=0.5, patience=3, min_lr=5e-5
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optim, T_max=epochs, eta_min=1e-5
     )
     
     # Multiple loss functions for better results
@@ -413,9 +448,20 @@ def train(
             if audio_pred.device != device:
                 audio_pred = audio_pred.to(device)
                 
+            # Get the original audio for the target from the dataset
+            target_wav = torch.tensor(dataset._load_wav(dataset.wav_paths[idx]), device=device)
+            
+            # Apply RMS normalization to both prediction and target audio
+            normalized_pred = rms_normalize(audio_pred)
+            normalized_target = rms_normalize(target_wav)
+                
             # audio_pred is (1, samples) - transform it to spectrogram using device-specific transform
-            pred_log_mel = mel_transform(audio_pred)
+            pred_log_mel = mel_transform(normalized_pred)
             pred_log_mel = 20 * torch.log10(pred_log_mel.clamp(min=1e-5))
+            
+            # Re-compute target log_mel from the normalized target audio
+            target_mel = mel_transform(normalized_target.unsqueeze(0))
+            target_log_mel = 20 * torch.log10(target_mel.clamp(min=1e-5)).unsqueeze(0)
             # Shape will be [1, n_mels, T]
 
             # Standardize to 3D tensors [batch, n_mels, time] for consistent processing
@@ -461,9 +507,10 @@ def train(
             loss = loss / gradient_accumulation_steps
             loss.backward()
             
+            torch.nn.utils.clip_grad_norm_([base_voice], 1.0)
+
             # Only step optimizer after accumulating gradients from multiple samples
             if batch_count % gradient_accumulation_steps == 0 or batch_count == len(loader):
-                torch.nn.utils.clip_grad_norm_([base_voice], 1.0)
                 optim.step()
                 optim.zero_grad()
                 
@@ -523,12 +570,26 @@ def train(
                     if val_ids.shape[1] < 3:
                         continue
                     
-                    # Generate audio with current voice embedding
+                    # Generate audio
                     val_audio_pred, _ = model.forward_with_tokens.__wrapped__(model, val_ids, base_voice)
                     
+                    # Get the original audio for the target from the validation dataset
+                    val_idx = val_loader.batch_sampler.sampler.data_source.wav_paths.index(
+                        validation_dataset.wav_paths[validation_loader.batch_sampler.sampler.indices[0]])
+                    val_target_wav = torch.tensor(validation_dataset._load_wav(validation_dataset.wav_paths[val_idx]), 
+                                                 device=device)
+                    
+                    # Apply RMS normalization to both prediction and target audio
+                    val_normalized_pred = rms_normalize(val_audio_pred)
+                    val_normalized_target = rms_normalize(val_target_wav)
+                    
                     # Convert to mel spectrogram
-                    val_pred_mel = mel_transform(val_audio_pred)
+                    val_pred_mel = mel_transform(val_normalized_pred)
                     val_pred_log_mel = 20 * torch.log10(val_pred_mel.clamp(min=1e-5))
+                    
+                    # Re-compute target log_mel from the normalized target audio
+                    val_target_mel = mel_transform(val_normalized_target.unsqueeze(0))
+                    val_target_log_mel = 20 * torch.log10(val_target_mel.clamp(min=1e-5)).unsqueeze(0)
                     
                     # Standardize dimensions
                     if val_target_log_mel.dim() == 4:
@@ -549,6 +610,15 @@ def train(
                 if val_losses:
                     validation_loss = sum(val_losses) / len(val_losses)
                     print(f"Epoch {epoch:>3}/{epochs}: training loss {avg_loss:.4f}, validation loss {validation_loss:.4f}")
+                    
+                    # Save best model (lowest validation L1 loss after epoch 5)
+                    if save_best and epoch >= 5 and validation_loss < best_val_loss:
+                        best_val_loss = validation_loss
+                        best_epoch = epoch
+                        print(f"New best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
+                        # Create output directory if it doesn't exist
+                        os.makedirs(f"{out}/{name}", exist_ok=True)
+                        save_voice(base_voice, voice_embed, f"{out}/{name}/{name}.best.pt")
                 else:
                     print(f"Epoch {epoch:>3}/{epochs}: training loss {avg_loss:.4f} (no validation samples processed)")
             model.train()  # Set model back to training mode
@@ -602,8 +672,15 @@ def train(
         if (epoch % log_audio_every == 0 or epoch == epochs) and (writer is not None or use_wandb):
             # Generate a sample with current voice embedding
             with torch.no_grad():
-                # Use the first training sample for consistent comparison
-                sample_text = dataset.sentences[0]
+                # Use a different validation sample each epoch for better monitoring of phoneme drift
+                if validation_dataset and len(validation_dataset) > 0:
+                    # Pick a validation sample based on epoch number for variety
+                    sample_idx = epoch % len(validation_dataset)
+                    sample_text = validation_dataset.sentences[sample_idx]
+                else:
+                    # Fall back to training data with rotating selection if no validation set
+                    sample_idx = epoch % len(dataset)
+                    sample_text = dataset.sentences[sample_idx]
                 phonemes, _ = g2p.g2p(sample_text)
                 
                 if phonemes:
@@ -714,6 +791,11 @@ def train(
     # Save the final voice tensor
     os.makedirs(f"{out}/{name}", exist_ok=True)
     save_voice(base_voice, voice_embed, f"{out}/{name}/{name}.pt")
+    
+    # Print summary info about best checkpoint if available
+    if save_best and best_epoch > 0:
+        print(f"\nTraining complete. Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
+        print(f"Best model saved to: {out}/{name}/{name}.best.pt")
     
     # Close monitoring tools
     if writer is not None:
