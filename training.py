@@ -291,22 +291,27 @@ def train(
     # Set up optimizer with weight decay for regularization
     optim = torch.optim.Adam([base_voice], lr=lr, weight_decay=1e-6)
     
-    # Learning rate scheduling based on specified policy
-    if lr_decay_schedule is None or lr_decay_schedule == 'plateau':
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optim, mode='min', factor=lr_decay_rate, patience=5  # Reduced patience from 10 to 5
-        )
-    elif lr_decay_schedule == 'step':
-        # Default steps if none provided
-        steps = lr_decay_epochs or [int(epochs * 0.3), int(epochs * 0.6), int(epochs * 0.8)]
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optim, milestones=steps, gamma=lr_decay_rate
-        )
-    elif lr_decay_schedule == 'auto':
-        # Automatically decay learning rate every few epochs
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optim, step_size=5, gamma=lr_decay_rate  # Decay every 5 epochs
-        )
+    # # Learning rate scheduling based on specified policy
+    # if lr_decay_schedule is None or lr_decay_schedule == 'plateau':
+    #     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    #         optim, mode='min', factor=lr_decay_rate, patience=5  # Reduced patience from 10 to 5
+    #     )
+    # elif lr_decay_schedule == 'step':
+    #     # Default steps if none provided
+    #     steps = lr_decay_epochs or [int(epochs * 0.3), int(epochs * 0.6), int(epochs * 0.8)]
+    #     scheduler = torch.optim.lr_scheduler.MultiStepLR(
+    #         optim, milestones=steps, gamma=lr_decay_rate
+    #     )
+    # elif lr_decay_schedule == 'auto':
+    #     # Automatically decay learning rate every few epochs
+    #     scheduler = torch.optim.lr_scheduler.StepLR(
+    #         optim, step_size=5, gamma=lr_decay_rate  # Decay every 5 epochs
+    #     )
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optim, mode='min', factor=0.5, patience=8, verbose=True,
+        min_lr=5e-5       # ❶  never go below this
+    )
     
     # Multiple loss functions for better results
     l1_loss_fn = nn.L1Loss()
@@ -606,35 +611,18 @@ def train(
         current_style_std = current_style.std().item()
         
         # Check if we need to freeze timbre based on standard deviation threshold
-        if timbre_freeze_threshold is not None and current_timbre_std >= timbre_freeze_threshold:
-            if current_timbre.requires_grad:
-                print(f"Freezing timbre part of embedding (std={current_timbre_std:.4f} >= threshold={timbre_freeze_threshold:.4f})")
-                # Detach the timbre part of the voice embedding from the computation graph
-                base_voice.requires_grad_(False)
-                # Create a new tensor with only the style part requiring gradients
-                new_base_voice = torch.zeros_like(base_voice)
-                new_base_voice[0, :128] = base_voice[0, :128].detach().clone()  # Frozen timbre
-                new_base_voice[0, 128:] = base_voice[0, 128:].clone()          # Still trainable style
-                new_base_voice[0, 128:].requires_grad_(True)                   # Only update style now
-                
-                # Replace the old tensor and update optimizer
-                base_voice = new_base_voice
-                optim = torch.optim.Adam([{'params': base_voice[0, 128:]}], lr=optim.param_groups[0]['lr'], weight_decay=1e-6)
-                
-                # Update scheduler to track the new optimizer
-                if lr_decay_schedule is None or lr_decay_schedule == 'plateau':
-                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                        optim, mode='min', factor=lr_decay_rate, patience=5
-                    )
-                elif lr_decay_schedule == 'step':
-                    steps = lr_decay_epochs or [int(epochs * 0.3), int(epochs * 0.6), int(epochs * 0.8)]
-                    scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                        optim, milestones=steps, gamma=lr_decay_rate
-                    )
-                elif lr_decay_schedule == 'auto':
-                    scheduler = torch.optim.lr_scheduler.StepLR(
-                        optim, step_size=5, gamma=lr_decay_rate
-                    )
+        if (timbre_freeze_threshold is not None
+                and current_timbre_std >= timbre_freeze_threshold
+                and base_voice[0, :128].requires_grad):
+            print(f"Freezing timbre (std={current_timbre_std:.3f})")
+            base_voice[0, :128].requires_grad_(False)
+
+            # Remove timbre slice from the optimiser’s param list
+            optim = torch.optim.Adam(
+                [{'params': base_voice[0, 128:]}],
+                lr=optim.param_groups[0]['lr'],
+                weight_decay=1e-6
+            )
         
         # Periodically normalize the voice tensor for better quality
         # This prevents drift and keeps voice characteristics appropriate
@@ -664,13 +652,7 @@ def train(
             # Create output directory if it doesn't exist
             os.makedirs(f"{out}/{name}", exist_ok=True)
             save_voice(base_voice, voice_embed, f"{out}/{name}/{name}.epoch{epoch}.pt")
-        
 
-        # Manual LR decay only if no scheduler is used
-        if lr_decay_schedule is None and epoch % 50 == 0:
-            for g in optim.param_groups:
-                g["lr"] *= 0.5
-                print(f"Manually reducing LR to {g['lr']}")
     
     # Save the final voice tensor
     os.makedirs(f"{out}/{name}", exist_ok=True)
