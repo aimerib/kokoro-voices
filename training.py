@@ -680,7 +680,8 @@ def train(
                 if phonemes:
                     # Generate audio
                     ids = text_to_input_ids(model, phonemes).to(device)
-                    audio_sample, _ = model.forward_with_tokens.__wrapped__(model, ids, base_voice)
+                    voice_input = base_voice.to(device)
+                    audio_sample, _ = model.forward_with_tokens.__wrapped__(model, ids, voice_input)
                     audio_sample = audio_sample.squeeze().cpu().numpy()
                     
                     # Generate mel spectrogram for visualization
