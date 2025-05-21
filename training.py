@@ -212,7 +212,7 @@ def train(
     data_root: str | Path,
     epochs: int = 200,
     batch_size: int = 1,
-    lr: float = 5e-4,  # Reduced default learning rate (5-10x lower than original)
+    lr: float = 2e-4,  # Reduced default learning rate (5-10x lower than original)
     out: str = "output",
     name: str = "my_voice",
     n_mels: int = 80,
@@ -231,7 +231,7 @@ def train(
     lr_decay_rate: float = 0.5,                    # Factor to multiply LR when decaying
     lr_decay_epochs: List[int] = None,             # For 'step' schedule, epochs to decay
     timbre_freeze_threshold: Optional[float] = 0.25, # Freeze timbre embedding when std reaches this value (default: 0.25)
-    style_regularization: Optional[float] = 1e-3,   # L2 regularization on style part of embedding (default: 1e-3)
+    style_regularization: Optional[float] = 1e-4,   # L2 regularization on style part of embedding (default: 1e-3)
     skip_validation: bool = False,                  # Skip validation split
     save_best: bool = True,                        # Save best checkpoint (lowest validation L1 loss after epoch 5)
     upload_to_hf: bool = False,                    # Upload model and artifacts to HuggingFace
@@ -381,7 +381,7 @@ def train(
     best_epoch = 0
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optim, T_max=epochs, eta_min=1e-4
+        optim, T_max=epochs, eta_min=5e-6
     )
     
     # Multiple loss functions for better results
@@ -481,7 +481,7 @@ def train(
             # Higher weight on L1 ensures primary convergence
             # loss = l1_loss * 0.6 + mse_loss * 0.3 + freq_loss * 0.1 + style_reg_loss
 
-            loss = 0.5*l1_loss + 0.3*mse_loss + 0.2*freq_loss
+            loss = 0.5*l1_loss + 0.3*mse_loss + 0.2*freq_loss + style_reg_loss
             # -------------------- optimize using gradient accumulation -------------------------
             # Scale the loss by the accumulation steps to maintain the same gradients
             loss = loss / gradient_accumulation_steps
@@ -705,27 +705,27 @@ def train(
         current_timbre_std = current_timbre.std().item()
         current_style_std = current_style.std().item()
         
-        # if (timbre_freeze_threshold is not None
-        #         and current_timbre_std >= timbre_freeze_threshold
-        #         and base_voice.requires_grad):
+        if (timbre_freeze_threshold is not None
+                and current_timbre_std >= timbre_freeze_threshold
+                and base_voice.requires_grad):
 
-        #     print(f"Freezing timbre at std={current_timbre_std:.3f}")
+            print(f"Freezing timbre at std={current_timbre_std:.3f}")
 
-        #     # 1.  Grab constant timbre part
-        #     frozen_timbre = base_voice[0, :128].detach()     # (128,)
-        #     # 2.  Create a *new* leaf Parameter for style
-        #     style_param   = nn.Parameter(base_voice[0, 128:].detach())  # (128,)
-        #     # 3.  Re-assemble 256-dim voice each forward pass
-        #     def get_voice():
-        #         return torch.cat([frozen_timbre, style_param]).unsqueeze(0)  # (1,256)
+            # 1.  Grab constant timbre part
+            frozen_timbre = base_voice[0, :128].detach()     # (128,)
+            # 2.  Create a *new* leaf Parameter for style
+            style_param   = nn.Parameter(base_voice[0, 128:].detach())  # (128,)
+            # 3.  Re-assemble 256-dim voice each forward pass
+            def get_voice():
+                return torch.cat([frozen_timbre, style_param]).unsqueeze(0)  # (1,256)
 
-        #     base_voice = get_voice()           # first call
-        #     voice_getter = get_voice           # keep for later reuse
+            base_voice = get_voice()           # first call
+            voice_getter = get_voice           # keep for later reuse
 
-        #     # 4.  Re-initialise optimizer to track only style_param
-        #     optim = torch.optim.Adam([style_param], lr=optim.param_groups[0]['lr'],
-        #                             weight_decay=1e-6)
-        #     voice_for_input = voice_getter()
+            # 4.  Re-initialise optimizer to track only style_param
+            optim = torch.optim.Adam([style_param], lr=optim.param_groups[0]['lr'],
+                                    weight_decay=1e-6)
+            voice_for_input = voice_getter()
         
         # Periodically normalize the voice tensor for better quality
         # This prevents drift and keeps voice characteristics appropriate
