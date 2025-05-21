@@ -528,7 +528,8 @@ def train(
             print(f"{text[:20]}: loss {loss.item() * gradient_accumulation_steps:.4f} - {len(phonemes)} phonemes - epoch loss {epoch_loss:.4f}")
             
             # Log individual losses for current batch
-            step = (epoch - 1) * len(loader) + loader.batch_size
+            # Use running batch_count instead of loader.batch_size to avoid None when using Accelerate
+            step = (epoch - 1) * len(loader) + batch_count
             if writer is not None:
                 writer.add_scalar('Batch/L1_Loss', l1_loss.item(), step)
                 writer.add_scalar('Batch/MSE_Loss', mse_loss.item(), step)
