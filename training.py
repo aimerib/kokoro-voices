@@ -446,8 +446,12 @@ def train(
             voice_for_input = base_voice  # Already [1, 256] and requires_grad=True
                 
             # Forward pass – call the *undecorated* version to retain gradients
-            with torch.autocast(device_type=device.type if device.type != 'mps' else 'cpu', enabled=memory_efficient):
-                audio_pred, _ = model.forward_with_tokens.__wrapped__(  # type: ignore[attr-defined]
+            # Ensure all inputs are on the same device as the model
+            ids = ids.to(device)
+            voice_for_input = voice_for_input.to(device)
+            
+            # No need for autocast with accelerate - it handles this automatically
+            audio_pred, _ = model.forward_with_tokens.__wrapped__(  # type: ignore[attr-defined]
                     model, ids, voice_for_input
                 )
             
@@ -568,8 +572,10 @@ def train(
                     if val_ids.shape[1] < 3:
                         continue
                     
-                    # Generate audio
-                    val_audio_pred, _ = model.forward_with_tokens.__wrapped__(model, val_ids, base_voice)
+                    # Generate audio - ensure all inputs are on the same device
+                    val_ids = val_ids.to(device)
+                    voice_input = base_voice.to(device)
+                    val_audio_pred, _ = model.forward_with_tokens.__wrapped__(model, val_ids, voice_input)
                     
                     # Normalize prediction before Mel conversion
                     val_normalized_pred = rms_normalize(val_audio_pred)
