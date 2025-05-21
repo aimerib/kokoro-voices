@@ -2,6 +2,7 @@ torch
 numpy
 matplotlib
 huggingface_hub
+accelerate>=0.25.0
 pip # For kokoro
 
 torchaudio

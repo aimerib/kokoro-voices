@@ -50,6 +50,7 @@ from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
 import numpy as np
 
+from accelerate import Accelerator
 from huggingface_hub import snapshot_download, HfApi, upload_folder
 
 
@@ -72,6 +73,8 @@ from kokoro import KModel, KPipeline
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Device management is now handled by accelerate
+# This function is kept for backward compatibility with other scripts
 def get_device() -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
@@ -237,8 +240,14 @@ def train(
     upload_to_hf: bool = False,                    # Upload model and artifacts to HuggingFace
     hf_repo_id: Optional[str] = None,              # Repository ID for HuggingFace upload
 ):
-    device = get_device()
-    print(f"Using device: {device}")
+    # Initialize accelerator for mixed precision and gradient accumulation
+    accelerator = Accelerator(
+        mixed_precision="bf16",
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        device_placement=True,
+    )
+    device = accelerator.device
+    print(f"Using device: {device} with {accelerator.state.mixed_precision} precision")
     
     # Memory optimization settings
     if memory_efficient and device.type == "mps":
@@ -246,6 +255,8 @@ def train(
         # Force garbage collection to run more aggressively
         gc.enable()
         print(f"MPS HIGH_WATERMARK_RATIO set to {os.environ.get('PYTORCH_MPS_HIGH_WATERMARK_RATIO', 'default')}")
+    
+    print(f"Gradient accumulation steps: {accelerator.gradient_accumulation_steps}")
     
     # Set up monitoring tools
     writer = None
@@ -314,19 +325,17 @@ def train(
             shuffle=False
         )
         
-    # Effective batch size through gradient accumulation
-    # This provides the benefits of larger batches without memory issues
+    # Effective batch size is handled by accelerator's gradient_accumulation_steps
     effective_batch_size = batch_size
     if effective_batch_size > 1:
         print(f"Using effective batch size of {effective_batch_size} through gradient accumulation")
-        # Update gradient_accumulation_steps to match the requested batch size
-        gradient_accumulation_steps = effective_batch_size
+        # Note: accelerator was already initialized with this value
 
     # ---------------------------------------------------------------------
     # Model + voice embedding
     # ---------------------------------------------------------------------
     # model = KModel().to(device).eval()
-    model = KModel().to(device).train()
+    model = KModel().train()  # Accelerator will handle device placement
     for p in model.parameters():
         p.requires_grad_(False)
 
@@ -361,9 +370,9 @@ def train(
         style_mean, style_std = 0.0, 0.14
     
     # Initialize base voice with proper distribution
-    base_voice = torch.zeros((1, 256), device=device)
-    base_voice[0, :128] = torch.randn(128, device=device) * timbre_std + timbre_mean  # Timbre
-    base_voice[0, 128:] = torch.randn(128, device=device) * style_std + style_mean  # Style
+    base_voice = torch.zeros((1, 256))
+    base_voice[0, :128] = torch.randn(128) * timbre_std + timbre_mean  # Timbre
+    base_voice[0, 128:] = torch.randn(128) * style_std + style_mean  # Style
     base_voice.requires_grad_(True)
     
     # Initialize the voice tensor with the base voice
@@ -376,6 +385,13 @@ def train(
     # Set up optimizer with weight decay for regularization
     optim = torch.optim.Adam([base_voice], lr=lr, weight_decay=1e-6)
     
+    # Prepare model, base_voice, optimizer, and dataloaders with accelerator
+    model, base_voice, optim, loader = accelerator.prepare(
+        model, base_voice, optim, loader
+    )
+    if validation_loader is not None:
+        validation_loader = accelerator.prepare(validation_loader)
+    
     # Track best validation loss for saving best checkpoint
     best_val_loss = float('inf')
     best_epoch = 0
@@ -383,6 +399,9 @@ def train(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optim, T_max=epochs, eta_min=5e-6
     )
+    
+    # Prepare scheduler with accelerator
+    scheduler = accelerator.prepare(scheduler)
     
     # Multiple loss functions for better results
     l1_loss_fn = nn.L1Loss()
@@ -482,16 +501,14 @@ def train(
             # loss = l1_loss * 0.6 + mse_loss * 0.3 + freq_loss * 0.1 + style_reg_loss
 
             loss = 0.5*l1_loss + 0.3*mse_loss + 0.2*freq_loss + style_reg_loss
-            # -------------------- optimize using gradient accumulation -------------------------
-            # Scale the loss by the accumulation steps to maintain the same gradients
-            loss = loss / gradient_accumulation_steps
-            loss.backward()
+            # -------------------- optimize using accelerate for gradient accumulation -------------------------
+            # Accelerator handles gradient accumulation automatically
+            accelerator.backward(loss)
             
-            # Clip gradients of the *actual* trainable parameters (may change after timbre freeze)
-            torch.nn.utils.clip_grad_norm_(optim.param_groups[0]['params'], 1.0)
-
-            # Only step optimizer after accumulating gradients from multiple samples
-            if batch_count % gradient_accumulation_steps == 0 or batch_count == len(loader):
+            # Only step optimizer on sync gradients (handled by accelerator)
+            if accelerator.sync_gradients:
+                # Clip gradients of the *actual* trainable parameters (may change after timbre freeze)
+                accelerator.clip_grad_norm_(optim.param_groups[0]['params'], 1.0)
                 optim.step()
                 optim.zero_grad()
                 
@@ -725,6 +742,8 @@ def train(
             # 4.  Re-initialise optimizer to track only style_param
             optim = torch.optim.Adam([style_param], lr=optim.param_groups[0]['lr'],
                                     weight_decay=1e-6)
+            # Prepare the new optimizer with accelerator
+            optim = accelerator.prepare(optim)
             voice_for_input = voice_getter()
         
         # Periodically normalize the voice tensor for better quality
@@ -759,7 +778,8 @@ def train(
     
     # Save the final voice tensor
     os.makedirs(f"{out}/{name}", exist_ok=True)
-    save_voice(base_voice, voice_embed, f"{out}/{name}/{name}.pt")
+    # Unwrap model and tensors from accelerator before saving
+    save_voice(accelerator.unwrap_model(base_voice), voice_embed, f"{out}/{name}/{name}.pt")
     
     # Print summary info about best checkpoint if available
     if save_best and best_epoch > 0:
@@ -846,9 +866,16 @@ def save_voice(base_voice, voice_embed, out):
     save_path = Path(out)
     
     with torch.no_grad():
+        # Make sure base_voice is on CPU and detached from compute graph
+        if hasattr(base_voice, 'device'):
+            base_voice_cpu = base_voice.detach().cpu()
+        else:
+            # Handle accelerator-wrapped models/tensors
+            base_voice_cpu = base_voice.detach().cpu() if hasattr(base_voice, 'detach') else base_voice
+            
         # Update the full tensor one last time
         for i in range(MAX_PHONEME_LEN):
-            voice_embed[i, 0, :] = base_voice.clone()
+            voice_embed[i, 0, :] = base_voice_cpu.clone()
         
         torch.save(voice_embed.detach().cpu(), save_path)
         print(f"Saved full voice tensor to {save_path.resolve()} – shape {tuple(voice_embed.shape)}")
