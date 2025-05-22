@@ -196,7 +196,7 @@ class VoiceDataset(Dataset):
         mel = self.mel_transform(wav.unsqueeze(0))  # (1, n_mels, T)
         log_mel = 20 * torch.log10(mel.clamp(min=1e-5))
         # Keep batch dimension for consistency
-        return text, log_mel  # (1, n_mels, T)
+        return text, log_mel, wav.unsqueeze(0)
 
 
 # ---------------------------------------------------------------------------
@@ -443,12 +443,13 @@ def train(
                 torch.mps.empty_cache()
             gc.collect()
             
-        for text, target_log_mel in loader:
+        for text, target_log_mel, target_audio in loader:
             batch_count += 1
             
             # Process single sample (we're always using batch_size=1 for stability)
             text = text[0]  # batch_size=1
             target_log_mel = target_log_mel.to(device)
+            target_audio = target_audio.to(device)
             
             # Process the text input
             phonemes, _ = g2p.g2p(text)
@@ -528,10 +529,10 @@ def train(
             # Higher weight on L1 ensures primary convergence
             # loss = l1_loss * 0.6 + mse_loss * 0.3 + freq_loss * 0.1 + style_reg_loss
 
-            mr_pred = mrstft(audio_pred.squeeze(1))
-            mr_tgt  = mrstft(target_audio.squeeze(1))
+            wave_pred = audio_pred.flatten().unsqueeze(0)  # (1, T)
+            mr_pred = mrstft(wave_pred)
+            mr_tgt  = mrstft(target_audio)
             stft_loss = sum(l1(p, t) for p, t in zip(mr_pred, mr_tgt)) / len(fft_sizes)
-
             # combine
             loss = (
                 0.55 * l1_loss +
