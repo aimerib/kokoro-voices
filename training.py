@@ -687,8 +687,8 @@ def train(
             writer.add_scalar('Epoch/Learning_Rate', optim.param_groups[0]['lr'], epoch)
             
             # Log voice embedding stats
-            timbre_data = voice_embedding.base_voice[:128].detach().cpu().numpy()
-            style_data = voice_embedding.base_voice[128:].detach().cpu().numpy()
+            timbre_data = voice_embedding.base_voice[0, :128].detach().cpu().numpy()
+            style_data = voice_embedding.base_voice[0, 128:].detach().cpu().numpy()
             
             # Create histograms for timbre and style components
             writer.add_histogram('Voice/Timbre', timbre_data, epoch)
@@ -702,8 +702,8 @@ def train(
         
         if use_wandb and WANDB_AVAILABLE:
             # Log voice embedding stats
-            timbre_data = voice_embedding.base_voice[:128].detach().cpu().numpy()
-            style_data = voice_embedding.base_voice[128:].detach().cpu().numpy()
+            timbre_data = voice_embedding.base_voice[0, :128].detach().cpu().numpy()
+            style_data = voice_embedding.base_voice[0, 128:].detach().cpu().numpy()
             log_dict = {
                 'epoch': epoch,
                 'epoch_loss': avg_loss,
