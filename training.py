@@ -1079,14 +1079,9 @@ if __name__ == "__main__":
         log_dir=args.log_dir,
         memory_efficient=args.memory_efficient,
         gradient_accumulation_steps=args.grad_accumulation,
-        # Advanced training parameters
-        lr_decay_schedule=args.lr_decay,
-        lr_decay_rate=args.lr_decay_rate,
-        lr_decay_epochs=args.lr_decay_epochs,
         timbre_warning_threshold=args.timbre_warning,
         style_regularization=args.style_reg,
         skip_validation=args.skip_validation,
-        # HuggingFace upload
         upload_to_hf=args.upload_to_hf,
         hf_repo_id=args.hf_repo_id,
     )
