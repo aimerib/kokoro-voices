@@ -74,21 +74,6 @@ from kokoro import KModel, KPipeline
 # Helpers
 # ---------------------------------------------------------------------------
 
-fft_sizes = [1024, 512, 256]
-stft_windows = {n: torch.hann_window(n).to(device) for n in fft_sizes}
-
-def mrstft(x):
-    specs = []
-    for n in fft_sizes:
-        spec = spectrogram(
-            x, pad=0, window=stft_windows[n], n_fft=n,
-            hop_length=n//4, win_length=n, power=1
-        )
-        specs.append(torch.log(spec.clamp(1e-5)))
-    return specs
-
-l1 = nn.L1Loss()
-
 # Device management is now handled by accelerate
 # This function is kept for backward compatibility with other scripts
 def get_device() -> torch.device:
@@ -260,6 +245,22 @@ def train(
         device_placement=True,
     )
     device = accelerator.device
+
+    fft_sizes = [1024, 512, 256]
+    stft_windows = {n: torch.hann_window(n).to(device) for n in fft_sizes}
+
+    def mrstft(x):
+        specs = []
+        for n in fft_sizes:
+            spec = spectrogram(
+                x, pad=0, window=stft_windows[n], n_fft=n,
+                hop_length=n//4, win_length=n, power=1
+            )
+            specs.append(torch.log(spec.clamp(1e-5)))
+        return specs
+
+    l1 = nn.L1Loss()
+    
     print(f"Using device: {device} with {accelerator.state.mixed_precision} precision")
     
     # Memory optimization settings
