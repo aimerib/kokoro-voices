@@ -734,12 +734,12 @@ def train(
                     # Pick a validation sample based on epoch number for variety
                     sample_idx = epoch % len(validation_dataset)
                     sample_text = validation_dataset.sentences[sample_idx]
-                    reference_audio = torch.load(validation_dataset.wav_paths[sample_idx])
+                    reference_audio = validation_dataset._load_wav(validation_dataset.wav_paths[sample_idx])
                 else:
                     # Fall back to training data with rotating selection if no validation set
                     sample_idx = epoch % len(dataset)
                     sample_text = dataset.sentences[sample_idx]
-                    reference_audio = torch.load(dataset.wav_paths[sample_idx])
+                    reference_audio = dataset._load_wav(dataset.wav_paths[sample_idx])
                 phonemes, _ = g2p.g2p(sample_text)
                 
                 if phonemes:
