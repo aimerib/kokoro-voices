@@ -606,10 +606,11 @@ def train(
             model.eval()  # Set model to evaluation mode
             val_losses = []
             with torch.no_grad():
-                for val_text, val_target_log_mel in validation_loader:
+                for val_text, val_target_log_mel, val_target_audio in validation_loader:
                     # Process the validation sample
                     val_text = val_text[0]  # batch_size=1 for validation too
                     val_target_log_mel = val_target_log_mel.to(device)
+                    # We don't need val_target_audio for validation loss, but unpack it to match dataset format
                     
                     # Process text
                     phonemes, _ = g2p.g2p(val_text)
