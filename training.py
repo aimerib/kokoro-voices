@@ -53,6 +53,7 @@ import numpy as np
 from accelerate import Accelerator
 from huggingface_hub import snapshot_download, HfApi, upload_folder
 
+from torchaudio.functional import spectrogram
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -72,6 +73,21 @@ from kokoro import KModel, KPipeline
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+fft_sizes = [1024, 512, 256]
+stft_windows = {n: torch.hann_window(n).to(device) for n in fft_sizes}
+
+def mrstft(x):
+    specs = []
+    for n in fft_sizes:
+        spec = spectrogram(
+            x, pad=0, window=stft_windows[n], n_fft=n,
+            hop_length=n//4, win_length=n, power=1
+        )
+        specs.append(torch.log(spec.clamp(1e-5)))
+    return specs
+
+l1 = nn.L1Loss()
 
 # Device management is now handled by accelerate
 # This function is kept for backward compatibility with other scripts
@@ -511,7 +527,19 @@ def train(
             # Higher weight on L1 ensures primary convergence
             # loss = l1_loss * 0.6 + mse_loss * 0.3 + freq_loss * 0.1 + style_reg_loss
 
-            loss = 0.7*l1_loss + 0.25*mse_loss + 0.05*freq_loss
+            mr_pred = mrstft(audio_pred.squeeze(1))
+            mr_tgt  = mrstft(target_audio.squeeze(1))
+            stft_loss = sum(l1(p, t) for p, t in zip(mr_pred, mr_tgt)) / len(fft_sizes)
+
+            # combine
+            loss = (
+                0.55 * l1_loss +
+                0.25 * mse_loss +
+                0.05 * freq_loss +
+                0.15 * stft_loss +
+                style_reg_loss          # << still gated by epoch>10 & std>0.18
+            )
+            # loss = 0.7*l1_loss + 0.25*mse_loss + 0.05*freq_loss
             # -------------------- optimize using accelerate for gradient accumulation -------------------------
             # Accelerator handles gradient accumulation automatically
             accelerator.backward(loss)
@@ -736,6 +764,22 @@ def train(
         current_style = base_voice[0, 128:]
         current_timbre_std = current_timbre.std().item()
         current_style_std = current_style.std().item()
+
+        # after computing current_timbre / style stats each epoch
+        TARGET_STD = 0.30             # what we consider “healthy”
+        MAX_STD    = 0.35             # warn + clamp above this
+
+        if current_timbre_std > MAX_STD:
+            scale = TARGET_STD / (current_timbre.std() + 1e-8)
+            with torch.no_grad():
+                base_voice[0, :128] = (base_voice[0, :128] - current_timbre.mean()) * scale + timbre_mean
+            print(f"[Clamp] Timbre std {current_timbre_std:.3f} → {TARGET_STD}")
+
+        if current_style_std > MAX_STD:
+            scale = TARGET_STD / (current_style.std() + 1e-8)
+            with torch.no_grad():
+                base_voice[0, 128:] = (base_voice[0, 128:] - current_style.mean()) * scale + style_mean
+            print(f"[Clamp] Style  std {current_style_std:.3f} → {TARGET_STD}")
         
         # Monitor timbre variance – warn if it becomes too large.
         timbre_warning_threshold = timbre_warning_threshold if timbre_warning_threshold is not None else 0.3
