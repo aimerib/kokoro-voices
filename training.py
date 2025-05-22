@@ -734,10 +734,12 @@ def train(
                     # Pick a validation sample based on epoch number for variety
                     sample_idx = epoch % len(validation_dataset)
                     sample_text = validation_dataset.sentences[sample_idx]
+                    reference_audio = torch.load(validation_dataset.wav_paths[sample_idx])
                 else:
                     # Fall back to training data with rotating selection if no validation set
                     sample_idx = epoch % len(dataset)
                     sample_text = dataset.sentences[sample_idx]
+                    reference_audio = torch.load(dataset.wav_paths[sample_idx])
                 phonemes, _ = g2p.g2p(sample_text)
                 
                 if phonemes:
@@ -750,7 +752,9 @@ def train(
                     # Generate mel spectrogram for visualization
                     with torch.no_grad():
                         mel = mel_transform_cpu(torch.tensor(audio_sample).unsqueeze(0))
+                        reference_mel = mel_transform_cpu(torch.tensor(reference_audio).unsqueeze(0))
                         log_mel_sample = 20 * torch.log10(mel.clamp(min=1e-5))[0].cpu().numpy()
+                        log_reference_mel = 20 * torch.log10(reference_mel.clamp(min=1e-5))[0].cpu().numpy()
                     
                     # Use unified logger to log audio samples and spectrograms
                     logger.log_audio(
@@ -759,10 +763,21 @@ def train(
                         caption=f"Epoch {epoch}: {sample_text[:30]}",
                         step=epoch
                     )
+                    logger.log_audio(
+                        audio=reference_audio.squeeze().cpu().numpy(),
+                        sample_rate=24000,
+                        caption=f"Epoch {epoch}: {sample_text[:30]} (reference)",
+                        step=epoch
+                    )
                     
                     # Log spectrogram
                     logger.log_spectrogram(
                         spec_img=log_mel_sample,
+                        caption=f"Epoch {epoch}: {sample_text[:30]}",
+                        step=epoch
+                    )
+                    logger.log_spectrogram(
+                        spec_img=log_reference_mel,
                         caption=f"Epoch {epoch}: {sample_text[:30]}",
                         step=epoch
                     )
