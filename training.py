@@ -214,8 +214,8 @@ MAX_PHONEME_LEN = 510
 def train(
     data_root: str | Path,
     epochs: int = 200,
-    batch_size: int = 1,
-    lr: float = 2e-4,  # Reduced default learning rate (5-10x lower than original)
+    batch_size: int = 4,
+    lr: float = 3e-4,  # Reduced default learning rate (5-10x lower than original)
     out: str = "output",
     name: str = "my_voice",
     n_mels: int = 80,
@@ -230,11 +230,8 @@ def train(
     gradient_accumulation_steps: int = 1,
     memory_efficient: bool = True,
     # Advanced training controls
-    lr_decay_schedule: Optional[str] = None,       # 'auto', 'step', or 'plateau'
-    lr_decay_rate: float = 0.5,                    # Factor to multiply LR when decaying
-    lr_decay_epochs: List[int] = None,             # For 'step' schedule, epochs to decay
-    timbre_freeze_threshold: Optional[float] = 0.25, # Freeze timbre embedding when std reaches this value (default: 0.25)
-    style_regularization: Optional[float] = 1e-4,   # L2 regularization on style part of embedding (default: 1e-3)
+    timbre_warning_threshold: Optional[float] = 0.3, # Warn if timbre std exceeds this value (no freezing)
+    style_regularization: Optional[float] = 1e-5,   # L2 regularization on style part of embedding (default: 1e-5)
     skip_validation: bool = False,                  # Skip validation split
     save_best: bool = True,                        # Save best checkpoint (lowest validation L1 loss after epoch 5)
     upload_to_hf: bool = False,                    # Upload model and artifacts to HuggingFace
@@ -396,9 +393,17 @@ def train(
     best_val_loss = float('inf')
     best_epoch = 0
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optim, T_max=epochs, eta_min=5e-6
-    )
+    # Flat-then-cosine schedule: keep LR constant for first 25 % epochs then decay to eta_min.
+    import math
+    warmup_epochs = max(1, int(0.25 * epochs))
+    def lr_lambda(current_epoch: int):
+        if current_epoch < warmup_epochs:
+            return 1.0
+        # progress ∈ [0,1] for the remaining epochs
+        progress = (current_epoch - warmup_epochs) / max(1, (epochs - warmup_epochs))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
     
     # Prepare scheduler with accelerator
     scheduler = accelerator.prepare(scheduler)
@@ -496,15 +501,17 @@ def train(
             
             # 4. Optional style regularization (KL/L2) to control variance
             style_reg_loss = torch.tensor(0.0, device=device)
-            if style_regularization is not None and style_regularization > 0:
-                # L2 regularization on the style part of the embedding (second 128 values)
-                style_reg_loss = torch.norm(base_voice[0, 128:]) ** 2 * style_regularization
+            # Apply style regularisation only after epoch 10 and only if style variance is large
+            if epoch > 10 and style_regularization is not None and style_regularization > 0:
+                current_style_std_batch = base_voice[0, 128:].std().item()
+                if current_style_std_batch > 0.18:  # heuristic threshold
+                    style_reg_loss = torch.norm(base_voice[0, 128:]) ** 2 * style_regularization
             
             # Combine losses with appropriate weights
             # Higher weight on L1 ensures primary convergence
             # loss = l1_loss * 0.6 + mse_loss * 0.3 + freq_loss * 0.1 + style_reg_loss
 
-            loss = 0.5*l1_loss + 0.3*mse_loss + 0.2*freq_loss + style_reg_loss
+            loss = 0.7*l1_loss + 0.25*mse_loss + 0.05*freq_loss
             # -------------------- optimize using accelerate for gradient accumulation -------------------------
             # Accelerator handles gradient accumulation automatically
             accelerator.backward(loss)
@@ -730,49 +737,11 @@ def train(
         current_timbre_std = current_timbre.std().item()
         current_style_std = current_style.std().item()
         
-        if (timbre_freeze_threshold is not None
-                and current_timbre_std >= timbre_freeze_threshold
-                and base_voice.requires_grad):
-
-            print(f"Freezing timbre at std={current_timbre_std:.3f}")
-
-            # 1.  Grab constant timbre part
-            frozen_timbre = base_voice[0, :128].detach()     # (128,)
-            # 2.  Create a *new* leaf Parameter for style
-            style_param   = nn.Parameter(base_voice[0, 128:].detach())  # (128,)
-            # 3.  Re-assemble 256-dim voice each forward pass
-            def get_voice():
-                return torch.cat([frozen_timbre, style_param]).unsqueeze(0)  # (1,256)
-
-            base_voice = get_voice()           # first call
-            voice_getter = get_voice           # keep for later reuse
-
-            # 4.  Re-initialise optimizer to track only style_param
-            optim = torch.optim.Adam([style_param], lr=optim.param_groups[0]['lr'],
-                                    weight_decay=1e-6)
-            # Prepare the new optimizer with accelerator
-            optim = accelerator.prepare(optim)
-            voice_for_input = voice_getter()
+        # Monitor timbre variance – warn if it becomes too large.
+        timbre_warning_threshold = timbre_warning_threshold if timbre_warning_threshold is not None else 0.3
+        if current_timbre_std >= timbre_warning_threshold and epoch % 5 == 0:
+            print(f"[Warn] Timbre std high ({current_timbre_std:.3f}) at epoch {epoch}. Consider manual intervention.")
         
-        # Periodically normalize the voice tensor for better quality
-        # This prevents drift and keeps voice characteristics appropriate
-        if epoch % 25 == 0 and epoch > 0:
-            with torch.no_grad():
-                # Only normalize parts that aren't frozen
-                if base_voice[0, :128].requires_grad:  # If timbre isn't frozen
-                    current_timbre_mean = current_timbre.mean()
-                    # Adjust toward target statistics
-                    base_voice[0, :128] = ((current_timbre - current_timbre_mean) / current_timbre_std) * timbre_std + timbre_mean
-                
-                if base_voice[0, 128:].requires_grad:  # Style should always be trainable
-                    current_style_mean = current_style.mean()
-                    # Adjust toward target statistics
-                    base_voice[0, 128:] = ((current_style - current_style_mean) / current_style_std) * style_std + style_mean
-                
-                print(f"Normalized voice at epoch {epoch}:")
-                print(f"  Timbre: mean={base_voice[0, :128].mean().item():.4f}, std={base_voice[0, :128].std().item():.4f}")
-                print(f"  Style: mean={base_voice[0, 128:].mean().item():.4f}, std={base_voice[0, 128:].std().item():.4f}")
-
         # Update the full voice tensor
         for i in range(MAX_PHONEME_LEN):
             voice_embed[i, 0, :] = base_voice.clone()
@@ -786,8 +755,13 @@ def train(
     
     # Save the final voice tensor
     os.makedirs(f"{out}/{name}", exist_ok=True)
-    # Unwrap model and tensors from accelerator before saving
-    save_voice(accelerator.unwrap_model(base_voice), voice_embed, f"{out}/{name}/{name}.pt")
+    # Properly get the base_voice as a normal tensor (accelerator.unwrap_model is for models, not tensors)
+    if hasattr(base_voice, "detach"):
+        base_voice_cpu = base_voice.detach().cpu()
+    else:
+        # Handle accelerator-wrapped tensors
+        base_voice_cpu = base_voice
+    save_voice(base_voice_cpu, voice_embed, f"{out}/{name}/{name}.pt")
     
     # Print summary info about best checkpoint if available
     if save_best and best_epoch > 0:
@@ -842,7 +816,7 @@ def train(
             "n_fft": n_fft,
             "hop": hop,
             "style_regularization": style_regularization,
-            "timbre_freeze_threshold": timbre_freeze_threshold,
+            "timbre_warning_threshold": timbre_warning_threshold,
             "hf_repo_id": hf_repo_id,
         }
         
@@ -988,7 +962,7 @@ def create_readme(output_dir, name, best_epoch, dataset_stats, training_params):
 - **FFT Size:** {training_params.get('n_fft', 'N/A')}
 - **Hop Length:** {training_params.get('hop', 'N/A')}
 - **Style Regularization:** {training_params.get('style_regularization', 'N/A')}
-- **Timbre Freeze Threshold:** {training_params.get('timbre_freeze_threshold', 'N/A')}
+- **Timbre Warning Threshold:** {training_params.get('timbre_warning_threshold', 'N/A')}
 
 ## Usage
 
@@ -1030,7 +1004,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Train a Kokoro voice embedding")
     ap.add_argument("--data", type=str, help="Path to dataset directory")
     ap.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
-    ap.add_argument("--batch-size", type=int, default=1, help="Batch size")
+    ap.add_argument("--batch-size", type=int, default=4, help="Batch size")
     ap.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     ap.add_argument("--name", type=str, default="my_voice", help="Output voice file")
     ap.add_argument("--out", type=str, default="output", help="Output directory")
@@ -1053,9 +1027,9 @@ if __name__ == "__main__":
                               help="Factor to multiply learning rate by when decaying (e.g., 0.5 = halve it)")
     training_group.add_argument("--lr-decay-epochs", type=int, nargs='+',
                               help="Epochs at which to decay learning rate (only for 'step' decay)")
-    training_group.add_argument("--timbre-freeze", type=float, default=0.25,
-                              help="Freeze timbre part of embedding when its std reaches this value (e.g., 0.5)")
-    training_group.add_argument("--style-reg", type=float, default=1e-3,
+    training_group.add_argument("--timbre-warning", type=float, default=0.3,
+                              help="Print warning if timbre std exceeds this value (no freezing)")
+    training_group.add_argument("--style-reg", type=float, default=1e-5,
                               help="L2 regularization strength for style part of embedding (e.g., 1e-4)")
     training_group.add_argument("--skip-validation", type=bool, default=False,
                               help="Skip validation split (default: False)")
@@ -1109,7 +1083,7 @@ if __name__ == "__main__":
         lr_decay_schedule=args.lr_decay,
         lr_decay_rate=args.lr_decay_rate,
         lr_decay_epochs=args.lr_decay_epochs,
-        timbre_freeze_threshold=args.timbre_freeze,
+        timbre_warning_threshold=args.timbre_warning,
         style_regularization=args.style_reg,
         skip_validation=args.skip_validation,
         # HuggingFace upload
