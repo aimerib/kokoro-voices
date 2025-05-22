@@ -560,7 +560,6 @@ def train(
             loss = loss + smoothness_loss
             
             # Add smoothness loss to batch metrics for logging
-            batch_metrics['smoothness_loss'] = smoothness_loss.item()
             # loss = 0.7*l1_loss + 0.25*mse_loss + 0.05*freq_loss
             # -------------------- optimize using accelerate for gradient accumulation -------------------------
             # Accelerator handles gradient accumulation automatically
@@ -594,7 +593,8 @@ def train(
                 'batch_freq_loss': freq_loss,
                 'batch_stft_loss': stft_loss,
                 'batch_loss': loss.item(),
-                'step': step
+                'step': step,
+                'smoothness_loss': smoothness_loss.item()   
             }
             
             if style_regularization is not None and style_regularization > 0:
