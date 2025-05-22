@@ -49,6 +49,8 @@ import torchaudio
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+import tempfile
+import shutil
 
 from accelerate import Accelerator
 from huggingface_hub import snapshot_download, HfApi, upload_folder
@@ -703,10 +705,10 @@ def train(
                 'epoch': epoch,
                 'epoch_loss': avg_loss,
                 'learning_rate': optim.param_groups[0]['lr'],
-                'timbre_mean': base_voice[0, :128].mean().item(),
-                'timbre_std': base_voice[0, :128].std().item(),
-                'style_mean': base_voice[0, 128:].mean().item(),
-                'style_std': base_voice[0, 128:].std().item(),
+                'timbre_mean': timbre_data.mean().item(),
+                'timbre_std': timbre_data.std().item(),
+                'style_mean': style_data.mean().item(),
+                'style_std': style_data.std().item()
             }
             
             if validation_loss is not None:
@@ -716,8 +718,8 @@ def train(
             
             # Log histograms in W&B
             wandb.log({
-                'timbre_hist': wandb.Histogram(base_voice[0, :128].detach().cpu().numpy()),
-                'style_hist': wandb.Histogram(base_voice[0, 128:].detach().cpu().numpy())
+                'timbre_hist': wandb.Histogram(voice_embedding.base_voice[0, :128].detach().cpu().numpy()),
+                'style_hist': wandb.Histogram(voice_embedding.base_voice[0, 128:].detach().cpu().numpy())
             })
         
         # Log audio samples periodically
@@ -738,7 +740,7 @@ def train(
                 if phonemes:
                     # Generate audio
                     ids = text_to_input_ids(model, phonemes).to(device)
-                    voice_input = base_voice.to(device)
+                    voice_input = voice_embedding.base_voice.to(device)
                     audio_sample, _ = model.forward_with_tokens.__wrapped__(model, ids, voice_input)
                     audio_sample = audio_sample.squeeze().cpu().numpy()
                     
@@ -1037,7 +1039,14 @@ def create_readme(output_dir, name, best_epoch, dataset_stats, training_params):
     current_date = datetime.now().strftime("%Y-%m-%d")
     
     # Create README content
-    readme_content = f"""# {name} - Kokoro Voice Model
+    readme_content = f"""---
+tags:
+- tts
+- voice
+- kokoro
+base_model: "hexgrad/Kokoro-82M"
+---
+    # {name} - Kokoro Voice Model
 
 ## Model Information
 - **Created:** {current_date}

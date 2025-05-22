@@ -424,15 +424,3 @@ class VoiceEmbedding:
                     embedding.voice_embed[i, 0, :] = base_voice[0]
         
         return embedding
-
-
-# Function to save voice embedding for backward compatibility
-def save_voice(base_voice, voice_embed, path):
-    """Legacy save function for compatibility"""
-    # Make sure inputs are on CPU and detached from autograd
-    if hasattr(base_voice, "detach"):
-        base_voice = base_voice.detach().cpu()
-    if hasattr(voice_embed, "detach"):
-        voice_embed = voice_embed.detach().cpu()
-        
-    torch.save({"base_voice": base_voice, "voice_embed": voice_embed}, path)
