@@ -297,10 +297,7 @@ def train(
     random.seed(42)
     
     # Load pretrained Kokoro model
-    from kokoro.model import KModel, KPipeline
-    from kokoro.vocoder import Vocoder
-    model = KModel.from_pretrained()
-    vocoder = Vocoder.from_pretrained()
+    model = KModel()
     
     # Freeze the model - we're not fine-tuning it, just the embedding
     for param in model.parameters():
