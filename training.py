@@ -314,7 +314,7 @@ def train(
         n_mels=n_mels,
         center=True,
         power=1,  # amplitude, not power
-    )
+    ).to(device)
     
     # Keep a separate CPU version for inference
     mel_transform_cpu = torchaudio.transforms.MelSpectrogram(
@@ -1127,7 +1127,7 @@ if __name__ == "__main__":
     training_group.add_argument("--style-reg", type=float, default=1e-5,
                               help="L2 regularization strength for style part of embedding (e.g., 1e-4)")
     training_group.add_argument("--skip-validation", type=bool, default=False,
-                              help="Skip validation split (default: False)")
+                              help="Skip validation split")
     
     # Add monitoring arguments
     monitoring_group = ap.add_argument_group('Monitoring')
