@@ -701,6 +701,9 @@ def train(
             writer.add_scalar('Voice/Style_Std', style_data.std(), epoch)
         
         if use_wandb and WANDB_AVAILABLE:
+            # Log voice embedding stats
+            timbre_data = voice_embedding.base_voice[:128].detach().cpu().numpy()
+            style_data = voice_embedding.base_voice[128:].detach().cpu().numpy()
             log_dict = {
                 'epoch': epoch,
                 'epoch_loss': avg_loss,
