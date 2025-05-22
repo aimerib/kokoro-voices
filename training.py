@@ -30,30 +30,32 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 
 from __future__ import annotations
 
-import argparse
-import math
 import os
-import shutil
-import tempfile
-from datetime import datetime
-from pathlib import Path
-from typing import List, Tuple, Optional, Union, Dict, Any
-import random
-import json
 import gc
+import sys
+import json
+import math
+import time
+import random
+import argparse
+from pathlib import Path
+from typing import Optional, List, Tuple, Dict, Union, Any
 
-import torch
-import torchaudio
-from torch import nn
-from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
-import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchaudio
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
 from accelerate import Accelerator
 from huggingface_hub import snapshot_download, HfApi, upload_folder
-
 from torchaudio.functional import spectrogram
+
+# Import refactored utilities
+from utils import VoiceLoss, TrainingLogger, VoiceEmbedding, save_voice
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -245,21 +247,6 @@ def train(
         device_placement=True,
     )
     device = accelerator.device
-
-    fft_sizes = [1024, 512, 256]
-    stft_windows = {n: torch.hann_window(n).to(device) for n in fft_sizes}
-
-    def mrstft(x):
-        specs = []
-        for n in fft_sizes:
-            spec = spectrogram(
-                x, pad=0, window=stft_windows[n], n_fft=n,
-                hop_length=n//4, win_length=n, power=1, normalized=True
-            )
-            specs.append(torch.log(spec.clamp(1e-5)))
-        return specs
-
-    l1 = nn.L1Loss()
     
     print(f"Using device: {device} with {accelerator.state.mixed_precision} precision")
     
@@ -272,51 +259,80 @@ def train(
     
     print(f"Gradient accumulation steps: {accelerator.gradient_accumulation_steps}")
     
-    # Set up monitoring tools
-    writer = None
+    # Set up unified logger for TensorBoard and W&B
+    log_dir = log_dir or os.path.join('runs', Path(out).stem)
     if use_tensorboard:
-        log_dir = log_dir or os.path.join('runs', Path(out).stem)
-        writer = SummaryWriter(log_dir)
-        print(f"TensorBoard logs will be saved to {log_dir}")
+        os.makedirs(log_dir, exist_ok=True)
     
+    # Initialize logger
+    run_name = wandb_name or f"{name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    logger = TrainingLogger(
+        use_tensorboard=use_tensorboard, 
+        use_wandb=use_wandb,
+        log_dir=log_dir,
+        wandb_project=wandb_project or "kokoro-voice-training",
+        wandb_name=run_name
+    )
+    
+    # For backward compatibility
+    writer = logger.writer if use_tensorboard else None
+    WANDB_AVAILABLE = use_wandb
+    
+    # Store the config for W&B
     if use_wandb:
-        if not WANDB_AVAILABLE:
-            print("WARNING: W&B not available. Please install with 'pip install wandb'")
-        else:
-            wandb.init(
-                project=wandb_project or "kokoro-voice-training",
-                name=wandb_name or Path(out).stem,
-                config={
-                    "learning_rate": lr,
-                    "epochs": epochs,
-                    "batch_size": batch_size,
-                    "n_mels": n_mels,
-                    "n_fft": n_fft,
-                    "hop_length": hop,
-                    "output": out,
-                    "data_root": str(data_root),
-                }
-            )
-            print(f"W&B project initialized: {wandb_project or 'kokoro-voice-training'}")
+        import wandb
+        wandb.config.update({
+            "learning_rate": lr,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "n_mels": n_mels,
+            "n_fft": n_fft,
+            "hop_length": hop,
+            "output": out,
+            "data_root": str(data_root),
+        })
     
     # Set random seed for reproducibility
     torch.manual_seed(42)
     random.seed(42)
     
-    # Create two separate mel transforms - one for CPU (dataset) and one for device (training)
-    mel_transform_cpu = torchaudio.transforms.MelSpectrogram(
-        sample_rate=24_000, n_fft=n_fft, hop_length=hop, n_mels=n_mels
+    # Load pretrained Kokoro model
+    from kokoro.model import KModel, KPipeline
+    from kokoro.vocoder import Vocoder
+    model = KModel.from_pretrained()
+    vocoder = Vocoder.from_pretrained()
+    
+    # Freeze the model - we're not fine-tuning it, just the embedding
+    for param in model.parameters():
+        param.requires_grad = False
+        
+    # Ensure model is in eval mode for gradient flow to embedding only
+    model.eval()
+
+    # Set up mel spectrogram transform
+    mel_transform = torchaudio.transforms.MelSpectrogram(
+        sample_rate=24000,
+        n_fft=n_fft,
+        hop_length=hop,
+        n_mels=n_mels,
+        center=True,
+        power=1,  # amplitude, not power
     )
     
-    mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=24_000, n_fft=n_fft, hop_length=hop, n_mels=n_mels
-    ).to(device)
+    # Keep a separate CPU version for inference
+    mel_transform_cpu = torchaudio.transforms.MelSpectrogram(
+        sample_rate=24000,
+        n_fft=n_fft,
+        hop_length=hop,
+        n_mels=n_mels,
+        center=True,
+        power=1,
+    )
+    
+    # Initialize loss calculator
+    loss_calculator = VoiceLoss(device=device, fft_sizes=[1024, 512, 256])
 
     # Create dataset
-    dataset = VoiceDataset(data_root, mel_transform_cpu)
-    
-    # Split into training and validation sets if validation set size is specified
-    # Simply use the existing train/validation splits directly
     dataset = VoiceDataset(data_root, mel_transform_cpu, split="train")
     validation_dataset = None
     
@@ -358,50 +374,69 @@ def train(
     
     # Initialize with proper distribution similar to Kokoro voices
     # Get reference statistics from a known good voice (optional)
+    ref_voice = None
     try:
         from huggingface_hub import hf_hub_download
-        ref_path = hf_hub_download(repo_id='hexgrad/Kokoro-82M', filename='voices/af_heart.pt')
-        ref_voice = torch.load(ref_path, map_location=device)
+        try:
+            ref_path = hf_hub_download(repo_id='hexgrad/Kokoro-82M', filename='voices/af_heart.pt')
+            ref_voice = torch.load(ref_path, map_location=device)
+        except Exception as e:
+            print(f"Could not download reference voice: {e}")
+    except Exception as e:
+        print(f"Could not import hf_hub_download: {e}")
         
-        # Extract reference distribution statistics
-        if ref_voice.dim() == 3:
-            ref_voice = ref_voice[250, 0]  # Get middle-ish voice
-        elif ref_voice.dim() == 2 and ref_voice.shape[0] > 1:
-            ref_voice = ref_voice[0]
-
-        # Split into timbre and style for better initialization
-        timbre_mean = ref_voice[:128].mean().item()
-        timbre_std = ref_voice[:128].std().item()
-        style_mean = ref_voice[128:].mean().item()
-        style_std = ref_voice[128:].std().item()
-        
-        print(f"Initializing from reference distribution:")
-        print(f"  Timbre: mean={timbre_mean:.4f}, std={timbre_std:.4f}")
-        print(f"  Style: mean={style_mean:.4f}, std={style_std:.4f}")
+        # Initialize voice embedding with our utility class
+    voice_embedding = VoiceEmbedding(embedding_size=256, max_phoneme_len=MAX_PHONEME_LEN, device=device)
+    
+    # Try to initialize from reference if available
+    try:
+        # If reference embedding exists, we initialize from it
+        ref_path = f"{out}/{name}/reference.pt"
+        if not os.path.exists(ref_path):
+            ref_path = "reference.pt"
+            
+        if os.path.exists(ref_path):
+            print(f"Initializing from reference embedding: {ref_path}")
+            ref_data = torch.load(ref_path)
+            ref_voice = ref_data["base_voice"][0]
+            voice_embedding.base_voice.data = ref_data["base_voice"].to(device)
+            voice_embedding.update_full_embedding()
+            
+            # Set target statistics
+            voice_embedding.timbre_mean = ref_voice[:128].mean().item()
+            voice_embedding.timbre_std = ref_voice[:128].std().item()
+            voice_embedding.style_mean = ref_voice[128:].mean().item()
+            voice_embedding.style_std = ref_voice[128:].std().item()
+            
+            print(f"Reference statistics:")
+            print(f"  Timbre: mean={voice_embedding.timbre_mean:.4f}, std={voice_embedding.timbre_std:.4f}")
+            print(f"  Style: mean={voice_embedding.style_mean:.4f}, std={voice_embedding.style_std:.4f}")
     except Exception as e:
         print(f"Using default distribution, could not load reference: {e}")
-        timbre_mean, timbre_std = 0.0, 0.14
-        style_mean, style_std = 0.0, 0.14
     
-    # Initialize base voice with proper distribution
-    base_voice = torch.zeros((1, 256))
-    base_voice[0, :128] = torch.randn(128) * timbre_std + timbre_mean  # Timbre
-    base_voice[0, 128:] = torch.randn(128) * style_std + style_mean  # Style
-    base_voice.requires_grad_(True)
+    # For backward compatibility - the rest of the code expects these variables
+    # but now we use length-dependent embeddings instead of a single base_voice
+    voice_embed = voice_embedding.voice_embed
     
-    # Initialize the voice tensor with the base voice
-    for i in range(MAX_PHONEME_LEN):
-        # Start with the same vector, but we'll add small variations based on phoneme position
-        # This follows the pattern in train_full_voice.py
-        style_factor = max(0.5, 1.0 - (i / MAX_PHONEME_LEN) * 0.5)  # Decay expressivity for longer sequences
-        voice_embed[i, 0, :] = base_voice.clone()  # Copy the base voice to each position
+    # Note: voice_embedding.base_voice is now a property that returns the average
+    # of all length-dependent embeddings
+    print("Using length-dependent voice embeddings!")
+    print(f"Total trainable parameters: {voice_embed.numel():,d}")
+    
+    # Target statistics for health checks
+    timbre_mean = voice_embedding.timbre_mean
+    timbre_std = voice_embedding.timbre_std
+    style_mean = voice_embedding.style_mean
+    style_std = voice_embedding.style_std
 
     # Set up optimizer with weight decay for regularization
-    optim = torch.optim.Adam([base_voice], lr=lr, weight_decay=1e-6)
+    # Now we optimize all length-dependent embeddings
+    optim = torch.optim.Adam([voice_embedding.voice_embed], lr=lr, weight_decay=1e-6)
     
-    # Prepare model, base_voice, optimizer, and dataloaders with accelerator
-    model, base_voice, optim, loader = accelerator.prepare(
-        model, base_voice, optim, loader
+    # Prepare model, optimizer, and dataloaders with accelerator
+    # voice_embedding.voice_embed is already a parameter and will be handled by the optimizer
+    model, optim, loader = accelerator.prepare(
+        model, optim, loader
     )
     if validation_loader is not None:
         validation_loader = accelerator.prepare(validation_loader)
@@ -464,14 +499,16 @@ def train(
                 print(f"Skipping too short phoneme sequence: '{phonemes}'")
                 continue
 
-            # Here's the problem - when accessing a specific voice based on phoneme length,
-            # we need to make sure base_voice matches the expected shape for the model
-            voice_for_input = base_voice  # Already [1, 256] and requires_grad=True
+            # With length-dependent embeddings, we'll select the appropriate embedding
+            # based on the phoneme sequence length - this happens later
                 
             # Forward pass – call the *undecorated* version to retain gradients
             # Ensure all inputs are on the same device as the model
             ids = ids.to(device)
-            voice_for_input = voice_for_input.to(device)
+            
+            # Get the voice embedding for this specific phoneme length
+            phoneme_length = len(phonemes)
+            voice_for_input = voice_embedding.get_for_length(phoneme_length).to(device)
             
             # No need for autocast with accelerate - it handles this automatically
             audio_pred, _ = model.forward_with_tokens.__wrapped__(  # type: ignore[attr-defined]
@@ -501,57 +538,32 @@ def train(
             # Use the dynamic truncation helper for cleaner code
             pred_for_loss, target_for_loss = dynamic_time_truncation(pred_log_mel, target_for_loss)
             
-            # Multiple loss components for better learning
-            # 1. L1 loss on mel-spectrogram (primary loss)
-            l1_loss = l1_loss_fn(pred_for_loss, target_for_loss)
+            # Calculate all losses using our unified loss calculator
+            # Get the style vector from the specific length embedding we used
+            style_vector = voice_for_input[0, 0, voice_embedding.embedding_size//2:]
             
-            # 2. MSE loss for spectral contour
-            mse_loss = mse_loss_fn(pred_for_loss, target_for_loss)
-            
-            # 3. High-frequency emphasis loss - focus on important details
-            # Calculate gradients in frequency domain (approximate gradients across mel bands)
-            if pred_for_loss.shape[1] > 1:  # Need at least 2 mel bands
-                pred_diff = pred_for_loss[:, 1:] - pred_for_loss[:, :-1]
-                target_diff = target_for_loss[:, 1:] - target_for_loss[:, :-1]
-                freq_loss = l1_loss_fn(pred_diff, target_diff) * 0.5
-            else:
-                freq_loss = torch.tensor(0.0, device=device)
-            
-            # 4. Optional style regularization (KL/L2) to control variance
-            style_reg_loss = torch.tensor(0.0, device=device)
-            # Apply style regularisation only after epoch 10 and only if style variance is large
-            if epoch > 10 and style_regularization is not None and style_regularization > 0:
-                current_style_std_batch = base_voice[0, 128:].std().item()
-                if current_style_std_batch > 0.18:  # heuristic threshold
-                    style_reg_loss = torch.norm(base_voice[0, 128:]) ** 2 * style_regularization
-            
-            # Combine losses with appropriate weights
-            # Higher weight on L1 ensures primary convergence
-            # loss = l1_loss * 0.6 + mse_loss * 0.3 + freq_loss * 0.1 + style_reg_loss
-
-            # Process audio for STFT loss with dynamic truncation to handle different lengths
-            wave_pred = audio_pred.flatten().unsqueeze(0)  # (1, T)
-            wave_tgt = target_audio.squeeze(1)  # (1, T)
-            
-            # Truncate to the shorter length to prevent dimension mismatch
-            min_length = min(wave_pred.size(-1), wave_tgt.size(-1))
-            wave_pred_trunc = wave_pred[..., :min_length]
-            wave_tgt_trunc = wave_tgt[..., :min_length]
-            
-            # Compute multi-resolution STFT on length-matched audio
-            mr_pred = mrstft(wave_pred_trunc)
-            mr_tgt = mrstft(wave_tgt_trunc)
-            
-            # Average loss across all STFT resolutions
-            stft_loss = sum(l1(p, t) for p, t in zip(mr_pred, mr_tgt)) / len(fft_sizes)
-            # combine
-            loss = (
-                0.55 * l1_loss +
-                0.25 * mse_loss +
-                0.05 * freq_loss +
-                0.15 * stft_loss +
-                style_reg_loss          # << still gated by epoch>10 & std>0.18
+            # Calculate total loss and get breakdown of components
+            loss, loss_components = loss_calculator(
+                pred_for_loss, target_for_loss,  # Mel spectrograms
+                audio_pred, target_audio,       # Raw audio
+                style_vector=style_vector,      # For style regularization from this length
+                epoch=epoch,                    # For conditional regularization
+                style_reg_strength=style_regularization
             )
+            
+            # Extract individual losses for logging
+            l1_loss = loss_components['l1_loss']
+            mse_loss = loss_components['mse_loss']
+            freq_loss = loss_components['freq_loss']
+            stft_loss = loss_components['stft_loss']
+            style_reg_loss = loss_components['style_reg_loss']
+            
+            # Add length smoothness regularization to prevent abrupt changes between lengths
+            smoothness_loss = voice_embedding.calculate_smoothness_loss(weight=0.005)
+            loss = loss + smoothness_loss
+            
+            # Add smoothness loss to batch metrics for logging
+            batch_metrics['smoothness_loss'] = smoothness_loss.item()
             # loss = 0.7*l1_loss + 0.25*mse_loss + 0.05*freq_loss
             # -------------------- optimize using accelerate for gradient accumulation -------------------------
             # Accelerator handles gradient accumulation automatically
@@ -575,28 +587,24 @@ def train(
             # print current step statistics
             print(f"{text[:20]}: loss {loss.item() * gradient_accumulation_steps:.4f} - {len(phonemes)} phonemes - epoch loss {epoch_loss:.4f}")
             
-            # Log individual losses for current batch
-            # Use running batch_count instead of loader.batch_size to avoid None when using Accelerate
+            # Log individual losses for current batch using unified logger
             step = (epoch - 1) * len(loader) + batch_count
-            if writer is not None:
-                writer.add_scalar('Batch/L1_Loss', l1_loss.item(), step)
-                writer.add_scalar('Batch/MSE_Loss', mse_loss.item(), step)
-                writer.add_scalar('Batch/Freq_Loss', freq_loss.item(), step)
-                if style_regularization is not None and style_regularization > 0:
-                    writer.add_scalar('Batch/Style_Reg_Loss', style_reg_loss.item(), step)
-                writer.add_scalar('Batch/Combined_Loss', loss.item(), step)
+            
+            # Prepare all metrics in a dictionary
+            batch_metrics = {
+                'batch_l1_loss': l1_loss,
+                'batch_mse_loss': mse_loss,
+                'batch_freq_loss': freq_loss,
+                'batch_stft_loss': stft_loss,
+                'batch_loss': loss.item(),
+                'step': step
+            }
+            
+            if style_regularization is not None and style_regularization > 0:
+                batch_metrics['batch_style_reg_loss'] = style_reg_loss
                 
-            if use_wandb and WANDB_AVAILABLE:
-                log_data = {
-                    'batch_l1_loss': l1_loss.item(),
-                    'batch_mse_loss': mse_loss.item(),
-                    'batch_freq_loss': freq_loss.item(),
-                    'batch_loss': loss.item(),
-                    'step': step
-                }
-                if style_regularization is not None and style_regularization > 0:
-                    log_data['batch_style_reg_loss'] = style_reg_loss.item()
-                wandb.log(log_data)
+            # Log all metrics at once
+            logger.log_metrics(batch_metrics, step)
 
         avg_loss = epoch_loss / len(loader)
         
@@ -624,7 +632,11 @@ def train(
                     
                     # Generate audio - ensure all inputs are on the same device
                     val_ids = val_ids.to(device)
-                    voice_input = base_voice.to(device)
+                    
+                    # For validation, use the appropriate length-specific voice
+                    val_phoneme_length = len(phonemes)
+                    voice_input = voice_embedding.get_for_length(val_phoneme_length).to(device)
+                    
                     val_audio_pred, _ = model.forward_with_tokens.__wrapped__(model, val_ids, voice_input)
                     
                     # Normalize prediction before Mel conversion
@@ -661,7 +673,7 @@ def train(
                         print(f"New best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
                         # Create output directory if it doesn't exist
                         os.makedirs(f"{out}/{name}", exist_ok=True)
-                        save_voice(base_voice, voice_embed, f"{out}/{name}/{name}.best.pt")
+                        voice_embedding.save(f"{out}/{name}/{name}.best.pt")
                 else:
                     print(f"Epoch {epoch:>3}/{epochs}: training loss {avg_loss:.4f} (no validation samples processed)")
             model.train()  # Set model back to training mode
@@ -676,8 +688,8 @@ def train(
             writer.add_scalar('Epoch/Learning_Rate', optim.param_groups[0]['lr'], epoch)
             
             # Log voice embedding stats
-            timbre_data = base_voice[0, :128].detach().cpu().numpy()
-            style_data = base_voice[0, 128:].detach().cpu().numpy()
+            timbre_data = voice_embedding.base_voice[:128].detach().cpu().numpy()
+            style_data = voice_embedding.base_voice[128:].detach().cpu().numpy()
             
             # Create histograms for timbre and style components
             writer.add_histogram('Voice/Timbre', timbre_data, epoch)
@@ -738,95 +750,95 @@ def train(
                         mel = mel_transform_cpu(torch.tensor(audio_sample).unsqueeze(0))
                         log_mel_sample = 20 * torch.log10(mel.clamp(min=1e-5))[0].cpu().numpy()
                     
-                    # Log to TensorBoard
-                    if writer is not None:
-                        writer.add_audio(f'Sample/{sample_text[:30]}', 
-                                         audio_sample.reshape(1, -1), 
-                                         epoch, 
-                                         sample_rate=24000)
-                        
-                        # Create and log mel spectrogram figure
-                        fig, ax = plt.subplots(figsize=(10, 4))
-                        im = ax.imshow(log_mel_sample, aspect='auto', origin='lower')
-                        plt.colorbar(im, ax=ax)
-                        plt.title(f'Epoch {epoch}: {sample_text[:30]}')
-                        plt.tight_layout()
-                        writer.add_figure('Spectrogram/Sample', fig, epoch)
-                        plt.close(fig)
+                    # Use unified logger to log audio samples and spectrograms
+                    logger.log_audio(
+                        audio=audio_sample,
+                        sample_rate=24000,
+                        caption=f"Epoch {epoch}: {sample_text[:30]}",
+                        step=epoch
+                    )
                     
-                    # Log to W&B
-                    if use_wandb and WANDB_AVAILABLE:
-                        wandb.log({f"audio_sample_epoch_{epoch}": wandb.Audio(
-                            audio_sample, 
-                            sample_rate=24000,
-                            caption=f"Epoch {epoch}: {sample_text[:30]}"
-                        )})
-                        
-                        # Log spectrogram to W&B
-                        fig, ax = plt.subplots(figsize=(10, 4))
-                        im = ax.imshow(log_mel_sample, aspect='auto', origin='lower')
-                        plt.colorbar(im, ax=ax)
-                        plt.title(f'Epoch {epoch}: {sample_text[:30]}')
-                        plt.tight_layout()
-                        wandb.log({f"spectrogram_epoch_{epoch}": wandb.Image(fig)})
-                        plt.close(fig)
+                    # Log spectrogram
+                    logger.log_spectrogram(
+                        spec_img=log_mel_sample,
+                        caption=f"Epoch {epoch}: {sample_text[:30]}",
+                        step=epoch
+                    )
         
         scheduler.step()
         
-        # Monitor embedding statistics to potentially freeze timbre
-        current_timbre = base_voice[0, :128]
-        current_style = base_voice[0, 128:]
-        current_timbre_std = current_timbre.std().item()
-        current_style_std = current_style.std().item()
-
-        # after computing current_timbre / style stats each epoch
-        TARGET_STD = 0.30             # what we consider “healthy”
-        MAX_STD    = 0.35             # warn + clamp above this
-
-        if current_timbre_std > MAX_STD:
-            scale = TARGET_STD / (current_timbre.std() + 1e-8)
-            with torch.no_grad():
-                base_voice[0, :128] = (base_voice[0, :128] - current_timbre.mean()) * scale + timbre_mean
-            print(f"[Clamp] Timbre std {current_timbre_std:.3f} → {TARGET_STD}")
-
-        if current_style_std > MAX_STD:
-            scale = TARGET_STD / (current_style.std() + 1e-8)
-            with torch.no_grad():
-                base_voice[0, 128:] = (base_voice[0, 128:] - current_style.mean()) * scale + style_mean
-            print(f"[Clamp] Style  std {current_style_std:.3f} → {TARGET_STD}")
+        # Check embedding health and apply clamping if needed
+        embedding_stats = voice_embedding.check_health(epoch=epoch, warning_threshold=timbre_warning_threshold)
         
-        # Monitor timbre variance – warn if it becomes too large.
-        timbre_warning_threshold = timbre_warning_threshold if timbre_warning_threshold is not None else 0.3
-        if current_timbre_std >= timbre_warning_threshold and epoch % 5 == 0:
-            print(f"[Warn] Timbre std high ({current_timbre_std:.3f}) at epoch {epoch}. Consider manual intervention.")
+        # Every 5 epochs, apply length smoothing to avoid discontinuities
+        if epoch % 5 == 0:
+            voice_embedding.apply_length_smoothing(weight=0.2)
+            print(f"Applied length smoothing at epoch {epoch}")
         
-        # Update the full voice tensor
-        for i in range(MAX_PHONEME_LEN):
-            voice_embed[i, 0, :] = base_voice.clone()
+        # Log embedding statistics with length variation
+        logger.log_embedding_stats(embedding_stats, step=epoch)
         
-        # Save the full voice tensor every 10 epochs
+        # Save the full voice tensor every 5 epochs
         if epoch % 5 == 0:
             # Create output directory if it doesn't exist
             os.makedirs(f"{out}/{name}", exist_ok=True)
-            save_voice(base_voice, voice_embed, f"{out}/{name}/{name}.epoch{epoch}.pt")
+            voice_embedding.save(f"{out}/{name}/{name}.epoch{epoch}.pt")
+            
+            # Visualize the length-dependent embeddings
+            if writer is not None:
+                # Create embedding visualization - show how they vary by length
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+                
+                # Extract timbre and style components
+                timbre_components = voice_embedding.voice_embed[:, 0, :voice_embedding.embedding_size//2].detach().cpu()
+                style_components = voice_embedding.voice_embed[:, 0, voice_embedding.embedding_size//2:].detach().cpu()
+                
+                # Calculate average over the feature dimension to show length trends
+                timbre_avg = torch.mean(timbre_components, dim=1).numpy()
+                style_avg = torch.mean(style_components, dim=1).numpy()
+                
+                # Show the first 200 lengths for better visualization
+                x = list(range(1, min(201, voice_embedding.max_phoneme_len + 1)))
+                ax1.plot(x, timbre_avg[:200])
+                ax1.set_title("Average Timbre Component by Phoneme Length")
+                ax1.set_xlabel("Phoneme Sequence Length")
+                ax1.set_ylabel("Average Activation")
+                
+                ax2.plot(x, style_avg[:200])
+                ax2.set_title("Average Style Component by Phoneme Length")
+                ax2.set_xlabel("Phoneme Sequence Length")
+                ax2.set_ylabel("Average Activation")
+                
+                plt.tight_layout()
+                writer.add_figure("Embeddings/Length_Variation", fig, epoch)
+                plt.close(fig)
 
     
-    # Save the final voice tensor
+    # Save the final voice embedding
     os.makedirs(f"{out}/{name}", exist_ok=True)
-    # Properly get the base_voice as a normal tensor (accelerator.unwrap_model is for models, not tensors)
-    if hasattr(base_voice, "detach"):
-        base_voice_cpu = base_voice.detach().cpu()
-    else:
-        # Handle accelerator-wrapped tensors
-        base_voice_cpu = base_voice
-    save_voice(base_voice_cpu, voice_embed, f"{out}/{name}/{name}.pt")
+    
+    # Add special flag for length-dependent training to the name
+    name_suffix = "_length_dependent"
+    if name and not name.endswith(name_suffix):
+        name = f"{name}{name_suffix}"
+        
+    if wandb_name is None:
+        wandb_name = f"{name}_{time.strftime('%Y%m%d_%H%M%S')}"
+        
+    # Use the VoiceEmbedding save method to save length-dependent embeddings
+    voice_embedding.save(f"{out}/{name}/{name}.pt")
+    
+    # Also save a backwards compatibility version
+    print("Saving backwards-compatible version for older inference code")
+    base_voice_avg = voice_embedding.base_voice.detach().cpu()
+    save_voice(base_voice_avg, voice_embedding.voice_embed.detach().cpu(), f"{out}/{name}/{name}.compat.pt")
     
     # Print summary info about best checkpoint if available
     if save_best and best_epoch > 0:
         print(f"\nTraining complete. Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
         print(f"Best model saved to: {out}/{name}/{name}.best.pt")
     
-    # Upload to HuggingFace if requested
+    # Upload to HuggingFace    # HF upload
     if upload_to_hf and hf_repo_id:
         # Collect dataset statistics
         total_samples = len(dataset)
@@ -839,37 +851,31 @@ def train(
             sample_durations = []
             
             for idx in sample_indices:
-                wav_path = dataset.wav_paths[idx]
-                info = torchaudio.info(wav_path)
-                sample_durations.append(info.num_frames / info.sample_rate)
-            
-            avg_duration = sum(sample_durations) / len(sample_durations)
-            total_duration = avg_duration * total_samples
-        else:
-            avg_duration = "Unknown"
-            total_duration = "Unknown"
+                try:
+                    path = dataset.wav_paths[idx]
+                    info = torchaudio.info(path)
+                    duration = info.num_frames / info.sample_rate
+                    sample_durations.append(duration)
+                except:
+                    pass
+                    
+            if sample_durations:
+                avg_duration = sum(sample_durations) / len(sample_durations)
+                total_duration = avg_duration * total_samples
         
+        # Create descriptive statistics
         dataset_stats = {
-            "num_samples": total_samples,
-            "total_duration": f"{total_duration:.2f}" if isinstance(total_duration, float) else total_duration,
-            "avg_duration": f"{avg_duration:.2f}" if isinstance(avg_duration, float) else avg_duration,
+            "total_samples": total_samples,
+            "total_duration_seconds": total_duration,
+            "total_duration_formatted": format_duration(total_duration) if total_duration > 0 else "Unknown",
+            "estimated": True
         }
         
-        # Collect audio samples
-        audio_samples = {}
-        if use_wandb and WANDB_AVAILABLE:
-            # Find any saved audio files from wandb runs
-            for epoch in range(1, epochs + 1, log_audio_every):
-                sample_path = f"wandb/latest-run/files/media/audio/audio_sample_epoch_{epoch}_*.wav"
-                matches = list(Path().glob(sample_path))
-                if matches:
-                    audio_samples[epoch] = str(matches[0])
-        
-        # Collect training parameters
+        # Add training parameters for README
         training_params = {
-            "lr": lr,
             "epochs": epochs,
             "batch_size": batch_size,
+            "learning_rate": lr,
             "n_mels": n_mels,
             "n_fft": n_fft,
             "hop": hop,
@@ -878,11 +884,49 @@ def train(
             "hf_repo_id": hf_repo_id,
         }
         
+        # Collect audio samples
+        audio_samples = []
+        if use_wandb and WANDB_AVAILABLE:
+            api = wandb.Api()
+            runs = api.runs(f"{wandb_project or 'kokoro-voice'}/{wandb.run.id}")
+            
+            artifacts = []
+            for artifact in runs.logged_artifacts():
+                if artifact.type == "audio":
+                    artifacts.append(artifact)
+            
+            # Find and download sample audios
+            if artifacts:
+                samples_dir = os.path.join(out, name, "samples")
+                os.makedirs(samples_dir, exist_ok=True)
+                
+                # Prioritize later epoch samples
+                for artifact in reversed(artifacts):
+                    artifact_dir = artifact.download()
+                    for filename in os.listdir(artifact_dir):
+                        if filename.endswith(".wav"):
+                            epoch = int(filename.split("_")[0].replace("epoch", ""))
+                            sample_text = "_".join(filename.split("_")[1:]).replace(".wav", "")
+                            
+                            # Add to the samples list
+                            if len(audio_samples) < 10:  # Limit to 10 samples
+                                audio_samples.append({
+                                    "epoch": epoch,
+                                    "text": sample_text,
+                                    "path": os.path.join("samples", filename)
+                                })
+                                
+                                # Copy to samples dir
+                                shutil.copy2(
+                                    os.path.join(artifact_dir, filename),
+                                    os.path.join(samples_dir, filename)
+                                )
+                                
         # Upload to HuggingFace
-        print(f"Uploading files to HuggingFace repository: {hf_repo_id}")
-        upload_to_huggingface(
-            output_dir=out,
-            name=name,
+        upload_model_to_hf(
+            local_dir=os.path.join(out, name),
+            repo_id=hf_repo_id,
+            voice_name=name,
             best_epoch=best_epoch,
             dataset_stats=dataset_stats,
             training_params=training_params,
@@ -891,12 +935,8 @@ def train(
         
         print(f"Successfully uploaded voice model to HuggingFace: https://huggingface.co/{hf_repo_id}")
 
-    # Close monitoring tools (always run)
-    if writer is not None:
-        writer.close()
-    
-    if use_wandb and WANDB_AVAILABLE:
-        wandb.finish()
+    # Close unified logger
+    logger.close()
 
 
 def save_voice(base_voice, voice_embed, out):
