@@ -529,9 +529,20 @@ def train(
             # Higher weight on L1 ensures primary convergence
             # loss = l1_loss * 0.6 + mse_loss * 0.3 + freq_loss * 0.1 + style_reg_loss
 
+            # Process audio for STFT loss with dynamic truncation to handle different lengths
             wave_pred = audio_pred.flatten().unsqueeze(0)  # (1, T)
-            mr_pred = mrstft(wave_pred)
-            mr_tgt  = mrstft(target_audio)
+            wave_tgt = target_audio.squeeze(1)  # (1, T)
+            
+            # Truncate to the shorter length to prevent dimension mismatch
+            min_length = min(wave_pred.size(-1), wave_tgt.size(-1))
+            wave_pred_trunc = wave_pred[..., :min_length]
+            wave_tgt_trunc = wave_tgt[..., :min_length]
+            
+            # Compute multi-resolution STFT on length-matched audio
+            mr_pred = mrstft(wave_pred_trunc)
+            mr_tgt = mrstft(wave_tgt_trunc)
+            
+            # Average loss across all STFT resolutions
             stft_loss = sum(l1(p, t) for p, t in zip(mr_pred, mr_tgt)) / len(fft_sizes)
             # combine
             loss = (
