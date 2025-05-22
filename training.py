@@ -62,8 +62,6 @@ from utils import VoiceLoss, TrainingLogger, VoiceEmbedding
 from dotenv import load_dotenv
 load_dotenv()
 
-# Import visualization tools
-from torch.utils.tensorboard import SummaryWriter
 
 # Optional W&B import - will be checked before use
 try:
@@ -276,9 +274,9 @@ def train(
         wandb_name=run_name
     )
     
-    # For backward compatibility
-    writer = logger.writer if use_tensorboard else None
-    WANDB_AVAILABLE = use_wandb
+    # # For backward compatibility
+    # writer = logger.writer if use_tensorboard else None
+    # WANDB_AVAILABLE = use_wandb
     
     # Store the config for W&B
     if use_wandb:
@@ -679,54 +677,59 @@ def train(
         else:
             print(f"Epoch {epoch:>3}/{epochs}: loss {avg_loss:.4f}")
         
-        # Log epoch metrics
-        if writer is not None:
-            writer.add_scalar('Epoch/Training_Loss', avg_loss, epoch)
-            if validation_loss is not None:
-                writer.add_scalar('Epoch/Validation_Loss', validation_loss, epoch)
-            writer.add_scalar('Epoch/Learning_Rate', optim.param_groups[0]['lr'], epoch)
+        # # Log epoch metrics
+        # if writer is not None:
+        #     writer.add_scalar('Epoch/Training_Loss', avg_loss, epoch)
+        #     if validation_loss is not None:
+        #         writer.add_scalar('Epoch/Validation_Loss', validation_loss, epoch)
+        #     writer.add_scalar('Epoch/Learning_Rate', optim.param_groups[0]['lr'], epoch)
             
-            # Log voice embedding stats
-            timbre_data = voice_embedding.base_voice[0, :128].detach().cpu().numpy()
-            style_data = voice_embedding.base_voice[0, 128:].detach().cpu().numpy()
+        #     # Log voice embedding stats
+        #     timbre_data = voice_embedding.base_voice[0, :128].detach().cpu().numpy()
+        #     style_data = voice_embedding.base_voice[0, 128:].detach().cpu().numpy()
             
-            # Create histograms for timbre and style components
-            writer.add_histogram('Voice/Timbre', timbre_data, epoch)
-            writer.add_histogram('Voice/Style', style_data, epoch)
+        #     # Create histograms for timbre and style components
+        #     writer.add_histogram('Voice/Timbre', timbre_data, epoch)
+        #     writer.add_histogram('Voice/Style', style_data, epoch)
             
-            # Log voice statistics
-            writer.add_scalar('Voice/Timbre_Mean', timbre_data.mean(), epoch)
-            writer.add_scalar('Voice/Timbre_Std', timbre_data.std(), epoch)
-            writer.add_scalar('Voice/Style_Mean', style_data.mean(), epoch)
-            writer.add_scalar('Voice/Style_Std', style_data.std(), epoch)
+        #     # Log voice statistics
+        #     writer.add_scalar('Voice/Timbre_Mean', timbre_data.mean(), epoch)
+        #     writer.add_scalar('Voice/Timbre_Std', timbre_data.std(), epoch)
+        #     writer.add_scalar('Voice/Style_Mean', style_data.mean(), epoch)
+        #     writer.add_scalar('Voice/Style_Std', style_data.std(), epoch)
         
-        if use_wandb and WANDB_AVAILABLE:
+        # if use_wandb and WANDB_AVAILABLE:
             # Log voice embedding stats
-            timbre_data = voice_embedding.base_voice[0, :128].detach().cpu().numpy()
-            style_data = voice_embedding.base_voice[0, 128:].detach().cpu().numpy()
-            log_dict = {
-                'epoch': epoch,
-                'epoch_loss': avg_loss,
-                'learning_rate': optim.param_groups[0]['lr'],
-                'timbre_mean': timbre_data.mean().item(),
-                'timbre_std': timbre_data.std().item(),
-                'style_mean': style_data.mean().item(),
-                'style_std': style_data.std().item()
-            }
-            
-            if validation_loss is not None:
-                log_dict['validation_loss'] = validation_loss
-                
-            wandb.log(log_dict)
-            
-            # Log histograms in W&B
-            wandb.log({
-                'timbre_hist': wandb.Histogram(voice_embedding.base_voice[0, :128].detach().cpu().numpy()),
-                'style_hist': wandb.Histogram(voice_embedding.base_voice[0, 128:].detach().cpu().numpy())
-            })
+        timbre_data = voice_embedding.base_voice[0, :128].detach().cpu().numpy()
+        style_data = voice_embedding.base_voice[0, 128:].detach().cpu().numpy()
+        log_dict = {
+            'epoch': epoch,
+            'epoch_loss': avg_loss,
+            'learning_rate': optim.param_groups[0]['lr'],
+            'timbre_mean': timbre_data.mean().item(),
+            'timbre_std': timbre_data.std().item(),
+            'style_mean': style_data.mean().item(),
+            'style_std': style_data.std().item()
+        }
         
+        if validation_loss is not None:
+            log_dict['validation_loss'] = validation_loss
+            
+        # wandb.log(log_dict)
+        
+        # # Log histograms in W&B
+        # wandb.log({
+        #     'timbre_hist': wandb.Histogram(voice_embedding.base_voice[0, :128].detach().cpu().numpy()),
+        #     'style_hist': wandb.Histogram(voice_embedding.base_voice[0, 128:].detach().cpu().numpy())
+        # })
+        logger.log_metrics(log_dict, epoch)
+        logger.log_metrics({
+            'timbre_hist': wandb.Histogram(voice_embedding.base_voice[0, :128].detach().cpu().numpy()),
+            'style_hist': wandb.Histogram(voice_embedding.base_voice[0, 128:].detach().cpu().numpy())
+        })
+    
         # Log audio samples periodically
-        if (epoch % log_audio_every == 0 or epoch == epochs) and (writer is not None or use_wandb):
+        if (epoch % log_audio_every == 0 or epoch == epochs):
             # Generate a sample with current voice embedding
             with torch.no_grad():
                 # Use a different validation sample each epoch for better monitoring of phoneme drift
@@ -802,33 +805,32 @@ def train(
             voice_embedding.save(f"{out}/{name}/{name}.epoch{epoch}.pt")
             
             # Visualize the length-dependent embeddings
-            if writer is not None:
-                # Create embedding visualization - show how they vary by length
-                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-                
-                # Extract timbre and style components
-                timbre_components = voice_embedding.voice_embed[:, 0, :voice_embedding.embedding_size//2].detach().cpu()
-                style_components = voice_embedding.voice_embed[:, 0, voice_embedding.embedding_size//2:].detach().cpu()
-                
-                # Calculate average over the feature dimension to show length trends
-                timbre_avg = torch.mean(timbre_components, dim=1).numpy()
-                style_avg = torch.mean(style_components, dim=1).numpy()
-                
-                # Show the first 200 lengths for better visualization
-                x = list(range(1, min(201, voice_embedding.max_phoneme_len + 1)))
-                ax1.plot(x, timbre_avg[:200])
-                ax1.set_title("Average Timbre Component by Phoneme Length")
-                ax1.set_xlabel("Phoneme Sequence Length")
-                ax1.set_ylabel("Average Activation")
-                
-                ax2.plot(x, style_avg[:200])
-                ax2.set_title("Average Style Component by Phoneme Length")
-                ax2.set_xlabel("Phoneme Sequence Length")
-                ax2.set_ylabel("Average Activation")
-                
-                plt.tight_layout()
-                writer.add_figure("Embeddings/Length_Variation", fig, epoch)
-                plt.close(fig)
+            # Create embedding visualization - show how they vary by length
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+            
+            # Extract timbre and style components
+            timbre_components = voice_embedding.voice_embed[:, 0, :voice_embedding.embedding_size//2].detach().cpu()
+            style_components = voice_embedding.voice_embed[:, 0, voice_embedding.embedding_size//2:].detach().cpu()
+            
+            # Calculate average over the feature dimension to show length trends
+            timbre_avg = torch.mean(timbre_components, dim=1).numpy()
+            style_avg = torch.mean(style_components, dim=1).numpy()
+            
+            # Show the first 200 lengths for better visualization
+            x = list(range(1, min(201, voice_embedding.max_phoneme_len + 1)))
+            ax1.plot(x, timbre_avg[:200])
+            ax1.set_title("Average Timbre Component by Phoneme Length")
+            ax1.set_xlabel("Phoneme Sequence Length")
+            ax1.set_ylabel("Average Activation")
+            
+            ax2.plot(x, style_avg[:200])
+            ax2.set_title("Average Style Component by Phoneme Length")
+            ax2.set_xlabel("Phoneme Sequence Length")
+            ax2.set_ylabel("Average Activation")
+            
+            plt.tight_layout()
+            logger.log_spectrogram(fig, "Length_Variation", epoch)
+            plt.close(fig)
 
     
     # Save the final voice embedding
