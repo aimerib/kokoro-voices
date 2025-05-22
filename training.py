@@ -505,7 +505,7 @@ def train(
             
             # Get the voice embedding for this specific phoneme length
             phoneme_length = len(phonemes)
-            voice_for_input = voice_embedding.get_for_length(phoneme_length).to(device)
+            voice_for_input = voice_embedding.get_for_length(phoneme_length).squeeze(1).to(device)
             
             # No need for autocast with accelerate - it handles this automatically
             audio_pred, _ = model.forward_with_tokens.__wrapped__(  # type: ignore[attr-defined]
@@ -537,7 +537,7 @@ def train(
             
             # Calculate all losses using our unified loss calculator
             # Get the style vector from the specific length embedding we used
-            style_vector = voice_for_input[0, 0, voice_embedding.embedding_size//2:]
+            style_vector = voice_for_input[voice_embedding.embedding_size//2:]
             
             # Calculate total loss and get breakdown of components
             loss, loss_components = loss_calculator(
@@ -632,7 +632,7 @@ def train(
                     
                     # For validation, use the appropriate length-specific voice
                     val_phoneme_length = len(phonemes)
-                    voice_input = voice_embedding.get_for_length(val_phoneme_length).to(device)
+                    voice_input = voice_embedding.get_for_length(val_phoneme_length).squeeze(1).to(device)
                     
                     val_audio_pred, _ = model.forward_with_tokens.__wrapped__(model, val_ids, voice_input)
                     
