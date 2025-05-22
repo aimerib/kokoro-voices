@@ -254,7 +254,7 @@ def train(
         for n in fft_sizes:
             spec = spectrogram(
                 x, pad=0, window=stft_windows[n], n_fft=n,
-                hop_length=n//4, win_length=n, power=1
+                hop_length=n//4, win_length=n, power=1, normalized=True
             )
             specs.append(torch.log(spec.clamp(1e-5)))
         return specs
