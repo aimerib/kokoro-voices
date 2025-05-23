@@ -227,7 +227,7 @@ class TrainingLogger:
             
         plt.close(fig)
     
-    def log_embedding_stats(self, stats, step):
+    def log_embedding_stats(self, stats, step=None):
         """Log embedding statistics"""
         if self.writer:
             for k, v in stats.items():
@@ -235,7 +235,7 @@ class TrainingLogger:
                 
         if self.use_wandb:
             import wandb
-            wandb.log({f"embedding_{k}": v for k, v in stats.items()}, step=step)
+            wandb.log({f"embedding_{k}": v for k, v in stats.items()})
     
     def close(self):
         """Close logger resources"""
