@@ -30,6 +30,7 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 
 from __future__ import annotations
 
+import datetime
 import os
 import gc
 import sys
@@ -84,6 +85,18 @@ def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+def format_duration(seconds: float) -> str:
+    """Format duration in seconds to a human-readable string."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = int(seconds % 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m {seconds}s"
+    else:
+        return f"{seconds}s"
 
 def pad_sequence_to_length(sequence, target_length, pad_value=0):
     """Pad a single tensor to a specific length along the last dimension."""
@@ -944,10 +957,9 @@ def train(
                                 )
                                 
         # Upload to HuggingFace
-        upload_model_to_hf(
-            local_dir=os.path.join(out, name),
-            repo_id=hf_repo_id,
-            voice_name=name,
+        upload_to_huggingface(
+            output_dir=os.path.join(out, name),
+            name=name,
             best_epoch=best_epoch,
             dataset_stats=dataset_stats,
             training_params=training_params,
