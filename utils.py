@@ -264,8 +264,9 @@ class VoiceEmbedding:
         
         # Initialize with small variations based on length
         with torch.no_grad():
-            # Start with a random base voice
-            base = torch.randn(1, embedding_size, device=device) * 0.01
+            # Start with a base voice with appropriate scale for Kokoro
+            # Kokoro voices typically have values in the range [-0.5, 0.5]
+            base = torch.randn(1, embedding_size, device=device) * 0.1
             
             # Create length-dependent variations
             for i in range(max_phoneme_len):

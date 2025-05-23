@@ -362,7 +362,26 @@ def train(
     random.seed(42)
     
     # Load pretrained Kokoro model
+    print("Loading pretrained Kokoro model...")
     model = KModel()
+    
+    # Download and load pretrained weights
+    try:
+        from huggingface_hub import hf_hub_download
+        # Download the pretrained model weights
+        model_path = hf_hub_download(repo_id='hexgrad/Kokoro-82M', filename='kokoro-v0_19.pth')
+        
+        # Load the state dict
+        state_dict = torch.load(model_path, map_location='cpu')
+        model.load_state_dict(state_dict, strict=True)
+        print("Loaded pretrained Kokoro weights successfully")
+    except Exception as e:
+        print(f"ERROR: Failed to load pretrained weights: {e}")
+        print("The model MUST have pretrained weights to generate speech!")
+        raise
+    
+    # Move model to device AFTER loading weights
+    model = model.to(device)
     
     # Freeze the model - we're not fine-tuning it, just the embedding
     for param in model.parameters():
@@ -432,23 +451,35 @@ def train(
     # Initialize a full 3D voice tensor [510, 1, 256] to match Kokoro's expected format
     voice_embed = torch.zeros((MAX_PHONEME_LEN, 1, 256), device=device)
     
-    # Initialize with proper distribution similar to Kokoro voices
-    # Get reference statistics from a known good voice (optional)
+    # Initialize voice embedding with our utility class
+    voice_embedding = VoiceEmbedding(embedding_size=256, max_phoneme_len=MAX_PHONEME_LEN, device=device)
+    
+    # Try to initialize from a known good Kokoro voice for better starting point
     ref_voice = None
     try:
         from huggingface_hub import hf_hub_download
         try:
+            # Try to get a reference voice from the official model
             ref_path = hf_hub_download(repo_id='hexgrad/Kokoro-82M', filename='voices/af_heart.pt')
             ref_voice = torch.load(ref_path, map_location=device)
+            
+            # If it's a single voice vector, use it as base
+            if ref_voice.dim() == 1 and ref_voice.shape[0] == 256:
+                print("Initializing from Kokoro reference voice")
+                with torch.no_grad():
+                    # Use reference as base but with some variation
+                    for i in range(voice_embedding.max_phoneme_len):
+                        # Add slight random variation to avoid exact copy
+                        noise = torch.randn_like(ref_voice) * 0.05
+                        voice_embedding.voice_embed[i, 0, :] = ref_voice + noise
+                        
+                print("✓ Initialized from reference voice with variations")
         except Exception as e:
             print(f"Could not download reference voice: {e}")
     except Exception as e:
         print(f"Could not import hf_hub_download: {e}")
-        
-        # Initialize voice embedding with our utility class
-    voice_embedding = VoiceEmbedding(embedding_size=256, max_phoneme_len=MAX_PHONEME_LEN, device=device)
     
-    # Try to initialize from reference if available
+    # Try to initialize from local reference if available
     try:
         # If reference embedding exists, we initialize from it
         ref_path = f"{out}/{name}/reference.pt"
@@ -875,7 +906,7 @@ def train(
                     if save_best and epoch >= 5 and validation_loss < best_val_loss:
                         best_val_loss = validation_loss
                         best_epoch = epoch
-                        print(f"✓ New best model! Validation loss improved to {best_val_loss:.4f}")
+                        print(f"New best model! Validation loss improved to {best_val_loss:.4f}")
                         # Create output directory if it doesn't exist
                         os.makedirs(f"{out}/{name}", exist_ok=True)
                         voice_embedding.save(f"{out}/{name}/{name}.best.pt")
@@ -892,7 +923,7 @@ def train(
         
         # Log audio samples and spectrograms every N epochs for monitoring convergence
         if epoch % log_audio_every == 0:
-            print(f"\n🎵 Logging audio samples for epoch {epoch}...")
+            print(f"\nLogging audio samples for epoch {epoch}...")
             
             # Use a sample from the dataset for comparison
             with torch.no_grad():
@@ -985,7 +1016,7 @@ def train(
                             is_reference=False
                         )
                         
-                        print(f"✓ Audio samples logged for epoch {epoch}")
+                        print(f"Logged audio samples for epoch {epoch}")
                         print(f"  Sample text: {sample_text[:60]}...")
                         print(f"  Phoneme length: {sample_phoneme_length}")
         # Save the full voice tensor every N epochs
@@ -994,7 +1025,7 @@ def train(
             os.makedirs(f"{out}/{name}", exist_ok=True)
             os.makedirs(f"{out}/{name}/checkpoints", exist_ok=True)
             voice_embedding.save(f"{out}/{name}/{name}.epoch{epoch}.pt")
-            print(f"✓ Checkpoint saved: {name}.epoch{epoch}.pt")
+            print(f"Checkpoint saved: {name}.epoch{epoch}.pt")
             
             # Save checkpoint with optimizer and scheduler states
             checkpoint_path = Path(out) / name / "checkpoints" / f"{name}.epoch{epoch}.pt"
@@ -1054,7 +1085,7 @@ def train(
         # Check for early stopping
         if validation_loss is not None:
             if early_stopping(validation_loss):
-                print(f"\n⚠️  Early stopping triggered at epoch {epoch}")
+                print(f"\nEarly stopping triggered at epoch {epoch}")
                 print(f"Validation loss hasn't improved for {patience} epochs")
                 print(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
                 break
