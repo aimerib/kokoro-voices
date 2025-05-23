@@ -17,11 +17,19 @@ from collections import deque
 import warnings
 warnings.filterwarnings('ignore')
 
+try:
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+except ImportError:
+    print("TensorBoard not installed. Install with: pip install tensorboard")
+    exit(1)
+
 class TrainingDashboard:
     def __init__(self, log_dir: Path, update_interval: int = 5):
         self.log_dir = Path(log_dir)
         self.update_interval = update_interval
-        self.metrics_file = self.log_dir / "metrics.json"
+        
+        # Find tensorboard logs
+        self.find_event_files()
         
         # Data storage with history
         self.history_length = 500
@@ -32,6 +40,7 @@ class TrainingDashboard:
         self.timbre_means = deque(maxlen=self.history_length)
         self.style_means = deque(maxlen=self.history_length)
         self.smoothness_losses = deque(maxlen=self.history_length)
+        self.batch_stft_losses = deque(maxlen=self.history_length)
         
         # Setup the figure and subplots
         self.fig = plt.figure(figsize=(15, 10))
@@ -50,19 +59,50 @@ class TrainingDashboard:
         
         # Status tracking
         self.last_update = None
-        self.training_start = None
-        self.best_val_loss = float('inf')
-        self.best_epoch = 0
+        self.training_active = False
+    
+    def find_event_files(self):
+        """Find TensorBoard event files in the log directory"""
+        # Look for runs directory (default TensorBoard structure)
+        runs_dir = self.log_dir / "runs"
+        if runs_dir.exists():
+            event_dirs = list(runs_dir.glob("*"))
+            if event_dirs:
+                # Use the most recent run
+                self.event_dir = max(event_dirs, key=lambda p: p.stat().st_mtime)
+                print(f"Found TensorBoard logs in: {self.event_dir}")
+                return
         
+        # Look for event files directly in log_dir
+        event_files = list(self.log_dir.glob("**/events.out.tfevents.*"))
+        if event_files:
+            # Use the most recent event file's directory
+            self.event_dir = max(event_files, key=lambda p: p.stat().st_mtime).parent
+            print(f"Found TensorBoard logs in: {self.event_dir}")
+            return
+            
+        # Also check wandb directory
+        wandb_dir = self.log_dir / "wandb"
+        if wandb_dir.exists():
+            print(f"Found WandB logs in: {wandb_dir}")
+            self.wandb_dir = wandb_dir
+        else:
+            self.wandb_dir = None
+            
+        # If no event files found, create a placeholder
+        self.event_dir = self.log_dir
+        print(f"No TensorBoard event files found yet in {self.log_dir}")
+        print("Waiting for training to start...")
+    
     def setup_plots(self):
-        """Initialize all subplot configurations"""
-        # Loss plot
-        self.ax_loss.set_title('Training Progress')
+        """Initialize all plot configurations"""
+        # Main loss plot
+        self.ax_loss.set_title('Training & Validation Loss')
         self.ax_loss.set_xlabel('Epoch')
         self.ax_loss.set_ylabel('Loss')
         self.ax_loss.grid(True, alpha=0.3)
         
-        # Embedding stats
+        # Embedding visualization
         self.ax_embedding.set_title('Voice Embedding Stats')
         self.ax_embedding.set_xlabel('Epoch')
         self.ax_embedding.set_ylabel('Mean Value')
@@ -75,242 +115,243 @@ class TrainingDashboard:
         self.ax_lr.grid(True, alpha=0.3)
         
         # Smoothness loss
-        self.ax_smoothness.set_title('Smoothness Loss')
+        self.ax_smoothness.set_title('Smoothness & STFT Loss')
         self.ax_smoothness.set_xlabel('Epoch')
         self.ax_smoothness.set_ylabel('Loss')
         self.ax_smoothness.grid(True, alpha=0.3)
         
-        # Key metrics text
-        self.ax_metrics.set_title('Key Metrics')
+        # Current metrics
         self.ax_metrics.axis('off')
         
-        # Status bar
-        self.ax_status.set_title('Training Status')
+        # Status text
         self.ax_status.axis('off')
         
         plt.tight_layout()
-        
-    def load_metrics(self):
-        """Load latest metrics from file"""
-        if not self.metrics_file.exists():
-            return False
-            
+    
+    def read_tensorboard_data(self):
+        """Read data from TensorBoard event files"""
         try:
-            with open(self.metrics_file, 'r') as f:
-                # Read all lines and parse the latest metrics
-                lines = f.readlines()
-                if not lines:
-                    return False
-                    
-                # Process last few lines to get latest data
-                for line in lines[-10:]:
-                    try:
-                        data = json.loads(line.strip())
-                        
-                        # Extract metrics
-                        if 'epoch' in data:
-                            epoch = data['epoch']
-                            if not self.epochs or epoch > self.epochs[-1]:
-                                self.epochs.append(epoch)
-                                
-                                # Training metrics
-                                if 'train_loss' in data:
-                                    self.train_losses.append(data['train_loss'])
-                                if 'val_loss' in data:
-                                    self.val_losses.append(data['val_loss'])
-                                    if data['val_loss'] < self.best_val_loss:
-                                        self.best_val_loss = data['val_loss']
-                                        self.best_epoch = epoch
-                                        
-                                # Embedding stats
-                                if 'timbre_mean' in data:
-                                    self.timbre_means.append(data['timbre_mean'])
-                                if 'style_mean' in data:
-                                    self.style_means.append(data['style_mean'])
-                                    
-                                # Other metrics
-                                if 'learning_rate' in data:
-                                    self.learning_rates.append(data['learning_rate'])
-                                if 'smoothness_loss' in data:
-                                    self.smoothness_losses.append(data['smoothness_loss'])
-                                    
-                                self.last_update = datetime.now()
-                                if self.training_start is None:
-                                    self.training_start = self.last_update
-                                    
-                    except json.JSONDecodeError:
-                        continue
-                        
-            return True
+            # Re-check for event files if we don't have any
+            if not hasattr(self, 'event_dir') or not any(self.event_dir.glob("events.out.tfevents.*")):
+                self.find_event_files()
+                
+            event_files = list(self.event_dir.glob("events.out.tfevents.*"))
+            if not event_files:
+                return None
+                
+            # Use the most recent event file
+            event_file = max(event_files, key=lambda p: p.stat().st_mtime)
+            
+            # Load events
+            ea = EventAccumulator(str(event_file.parent))
+            ea.Reload()
+            
+            # Get available scalar tags
+            scalar_tags = ea.Tags()['scalars']
+            
+            data = {}
+            
+            # Map TensorBoard tags to our expected metrics
+            tag_mapping = {
+                'Metrics/batch_loss': 'train_loss',
+                'Metrics/validation_loss': 'val_loss',
+                'Metrics/learning_rate': 'learning_rate',
+                'Metrics/timbre_mean': 'timbre_mean',
+                'Metrics/style_mean': 'style_mean',
+                'Metrics/smoothness_loss': 'smoothness_loss',
+                'Metrics/batch_stft_loss': 'batch_stft_loss',
+            }
+            
+            # Extract data for each metric
+            for tb_tag, metric_name in tag_mapping.items():
+                if tb_tag in scalar_tags:
+                    events = ea.Scalars(tb_tag)
+                    if events:
+                        # Get the latest value
+                        latest = events[-1]
+                        data[metric_name] = latest.value
+                        data['step'] = latest.step
+                        data['epoch'] = latest.step  # Assuming step is epoch
+                        data['wall_time'] = latest.wall_time
+            
+            return data if data else None
+            
         except Exception as e:
-            print(f"Error loading metrics: {e}")
-            return False
-            
-    def update_plots(self, frame):
-        """Update all plots with latest data"""
-        if not self.load_metrics():
+            print(f"Error reading TensorBoard data: {e}")
+            return None
+    
+    def update_data(self, frame):
+        """Update data from logs and refresh plots"""
+        # Read latest metrics
+        metrics = self.read_tensorboard_data()
+        
+        if metrics is None:
+            # Update status to show waiting
+            self.ax_status.clear()
+            self.ax_status.text(0.5, 0.5, 'Waiting for training data...\nMake sure training is running with --tensorboard flag', 
+                              ha='center', va='center', fontsize=12, color='orange')
+            self.ax_status.axis('off')
             return
+        
+        # Update data arrays
+        if 'epoch' in metrics:
+            self.epochs.append(metrics['epoch'])
             
-        # Clear all axes
-        for ax in [self.ax_loss, self.ax_embedding, self.ax_lr, self.ax_smoothness]:
-            ax.clear()
+        if 'train_loss' in metrics:
+            self.train_losses.append(metrics['train_loss'])
             
-        if len(self.epochs) > 0:
-            # Loss plot
-            if self.train_losses:
-                self.ax_loss.plot(list(self.epochs)[-len(self.train_losses):], 
-                                 list(self.train_losses), 'b-', label='Train Loss', linewidth=2)
-            if self.val_losses:
-                self.ax_loss.plot(list(self.epochs)[-len(self.val_losses):], 
-                                 list(self.val_losses), 'r-', label='Val Loss', linewidth=2)
-                self.ax_loss.axhline(y=self.best_val_loss, color='g', linestyle='--', 
-                                    label=f'Best Val ({self.best_val_loss:.4f})')
-            self.ax_loss.set_title('Training Progress')
-            self.ax_loss.set_xlabel('Epoch')
-            self.ax_loss.set_ylabel('Loss')
-            self.ax_loss.legend()
-            self.ax_loss.grid(True, alpha=0.3)
+        if 'val_loss' in metrics:
+            self.val_losses.append(metrics['val_loss'])
             
-            # Embedding stats
-            if self.timbre_means:
-                self.ax_embedding.plot(list(self.epochs)[-len(self.timbre_means):], 
-                                      list(self.timbre_means), 'g-', label='Timbre Mean', linewidth=2)
-            if self.style_means:
-                self.ax_embedding.plot(list(self.epochs)[-len(self.style_means):], 
-                                      list(self.style_means), 'm-', label='Style Mean', linewidth=2)
-            self.ax_embedding.set_title('Voice Embedding Stats')
-            self.ax_embedding.set_xlabel('Epoch')
-            self.ax_embedding.set_ylabel('Mean Value')
-            self.ax_embedding.legend()
-            self.ax_embedding.grid(True, alpha=0.3)
+        if 'learning_rate' in metrics:
+            self.learning_rates.append(metrics['learning_rate'])
             
-            # Learning rate
-            if self.learning_rates:
-                self.ax_lr.semilogy(list(self.epochs)[-len(self.learning_rates):], 
-                                   list(self.learning_rates), 'b-', linewidth=2)
-            self.ax_lr.set_title('Learning Rate')
-            self.ax_lr.set_xlabel('Epoch')
-            self.ax_lr.set_ylabel('LR')
-            self.ax_lr.grid(True, alpha=0.3)
+        if 'timbre_mean' in metrics:
+            self.timbre_means.append(metrics['timbre_mean'])
             
-            # Smoothness loss
-            if self.smoothness_losses:
-                self.ax_smoothness.plot(list(self.epochs)[-len(self.smoothness_losses):], 
-                                       list(self.smoothness_losses), 'r-', linewidth=2)
-                # Add warning threshold
-                if max(self.smoothness_losses) > 0.1:
-                    self.ax_smoothness.axhline(y=0.1, color='orange', linestyle='--', 
-                                              label='Warning Threshold')
-            self.ax_smoothness.set_title('Smoothness Loss')
-            self.ax_smoothness.set_xlabel('Epoch')
-            self.ax_smoothness.set_ylabel('Loss')
-            self.ax_smoothness.grid(True, alpha=0.3)
+        if 'style_mean' in metrics:
+            self.style_means.append(metrics['style_mean'])
             
-            # Update metrics display
-            self.update_metrics_display()
+        if 'smoothness_loss' in metrics:
+            self.smoothness_losses.append(metrics['smoothness_loss'])
             
-            # Update status
-            self.update_status()
-            
-    def update_metrics_display(self):
-        """Update the key metrics text display"""
+        if 'batch_stft_loss' in metrics:
+            self.batch_stft_losses.append(metrics['batch_stft_loss'])
+        
+        # Update plots
+        self.update_plots(metrics)
+        
+        # Update status
+        self.update_status(metrics)
+        
+        self.last_update = time.time()
+    
+    def update_plots(self, current_metrics):
+        """Update all plots with current data"""
+        # Clear all plots
+        self.ax_loss.clear()
+        self.ax_embedding.clear()
+        self.ax_lr.clear()
+        self.ax_smoothness.clear()
         self.ax_metrics.clear()
-        self.ax_metrics.set_title('Key Metrics')
+        
+        epochs_array = np.array(self.epochs)
+        
+        # Loss plot
+        if len(self.train_losses) > 0:
+            self.ax_loss.plot(epochs_array, self.train_losses, 'b-', label='Train Loss', linewidth=2)
+        if len(self.val_losses) > 0:
+            self.ax_loss.plot(epochs_array, self.val_losses, 'r-', label='Val Loss', linewidth=2)
+        self.ax_loss.set_title('Training & Validation Loss')
+        self.ax_loss.set_xlabel('Epoch')
+        self.ax_loss.set_ylabel('Loss')
+        self.ax_loss.legend()
+        self.ax_loss.grid(True, alpha=0.3)
+        
+        # Embedding stats
+        if len(self.timbre_means) > 0:
+            self.ax_embedding.plot(epochs_array, self.timbre_means, 'g-', label='Timbre Mean', linewidth=2)
+        if len(self.style_means) > 0:
+            self.ax_embedding.plot(epochs_array, self.style_means, 'm-', label='Style Mean', linewidth=2)
+        self.ax_embedding.set_title('Voice Embedding Stats')
+        self.ax_embedding.set_xlabel('Epoch')
+        self.ax_embedding.set_ylabel('Mean Value')
+        self.ax_embedding.legend()
+        self.ax_embedding.grid(True, alpha=0.3)
+        
+        # Learning rate
+        if len(self.learning_rates) > 0:
+            self.ax_lr.plot(epochs_array, self.learning_rates, 'orange', linewidth=2)
+        self.ax_lr.set_title('Learning Rate')
+        self.ax_lr.set_xlabel('Epoch')
+        self.ax_lr.set_ylabel('LR')
+        self.ax_lr.set_yscale('log')
+        self.ax_lr.grid(True, alpha=0.3)
+        
+        # Smoothness loss
+        if len(self.smoothness_losses) > 0:
+            self.ax_smoothness.plot(epochs_array, self.smoothness_losses, 'c-', label='Smoothness Loss', linewidth=2)
+        if len(self.batch_stft_losses) > 0:
+            self.ax_smoothness.plot(epochs_array, self.batch_stft_losses, 'y-', label='STFT Loss', linewidth=2)
+        self.ax_smoothness.set_title('Smoothness & STFT Loss')
+        self.ax_smoothness.set_xlabel('Epoch')
+        self.ax_smoothness.set_ylabel('Loss')
+        self.ax_smoothness.legend()
+        self.ax_smoothness.grid(True, alpha=0.3)
+        
+        # Current metrics display
+        if current_metrics:
+            metrics_text = "Current Metrics:\n\n"
+            metrics_text += f"Epoch: {current_metrics.get('epoch', 'N/A')}\n"
+            metrics_text += f"Train Loss: {current_metrics.get('train_loss', 'N/A'):.4f}\n" if 'train_loss' in current_metrics else ""
+            metrics_text += f"Val Loss: {current_metrics.get('val_loss', 'N/A'):.4f}\n" if 'val_loss' in current_metrics else ""
+            metrics_text += f"Learning Rate: {current_metrics.get('learning_rate', 'N/A'):.2e}\n" if 'learning_rate' in current_metrics else ""
+            metrics_text += f"Timbre Mean: {current_metrics.get('timbre_mean', 'N/A'):.4f}\n" if 'timbre_mean' in current_metrics else ""
+            
+            self.ax_metrics.text(0.1, 0.5, metrics_text, fontsize=11, va='center')
         self.ax_metrics.axis('off')
         
-        metrics_text = []
-        
-        if self.epochs:
-            metrics_text.append(f"Current Epoch: {self.epochs[-1]}")
-            
-        if self.train_losses:
-            metrics_text.append(f"Train Loss: {self.train_losses[-1]:.4f}")
-            
-        if self.val_losses:
-            metrics_text.append(f"Val Loss: {self.val_losses[-1]:.4f}")
-            
-        metrics_text.append(f"Best Val Loss: {self.best_val_loss:.4f} (Epoch {self.best_epoch})")
-        
-        if self.learning_rates:
-            metrics_text.append(f"Learning Rate: {self.learning_rates[-1]:.2e}")
-            
-        if self.smoothness_losses:
-            smoothness = self.smoothness_losses[-1]
-            metrics_text.append(f"Smoothness: {smoothness:.4f}")
-            if smoothness > 0.1:
-                metrics_text.append("⚠️ HIGH SMOOTHNESS LOSS")
-                
-        # Display metrics
-        y_pos = 0.9
-        for text in metrics_text:
-            self.ax_metrics.text(0.1, y_pos, text, fontsize=12, 
-                               transform=self.ax_metrics.transAxes)
-            y_pos -= 0.15
-            
-    def update_status(self):
-        """Update the status bar"""
+        plt.tight_layout()
+    
+    def update_status(self, metrics):
+        """Update status bar with training information"""
         self.ax_status.clear()
-        self.ax_status.set_title('Training Status')
-        self.ax_status.axis('off')
         
-        status_text = []
-        
-        # Time information
-        if self.last_update:
-            time_since_update = (datetime.now() - self.last_update).total_seconds()
-            if time_since_update > 300:  # 5 minutes
-                status_text.append(f"⚠️ No updates for {int(time_since_update/60)} minutes")
-            else:
-                status_text.append(f"✓ Last update: {self.last_update.strftime('%H:%M:%S')}")
+        if metrics:
+            # Check if training is active
+            if 'wall_time' in metrics:
+                time_since_update = time.time() - self.last_update if self.last_update else 0
+                self.training_active = time_since_update < 60  # Consider inactive after 60s
+            
+            status_color = 'green' if self.training_active else 'orange'
+            status_text = 'Training Active' if self.training_active else 'Training Paused/Complete'
+            
+            # Add warnings if needed
+            warnings = []
+            if 'timbre_mean' in metrics and abs(metrics['timbre_mean']) > 0.35:
+                warnings.append("⚠️  High timbre variance detected")
+            if 'train_loss' in metrics and metrics['train_loss'] > 10:
+                warnings.append("⚠️  High training loss")
                 
-        # Training duration
-        if self.training_start:
-            duration = datetime.now() - self.training_start
-            status_text.append(f"Training duration: {str(duration).split('.')[0]}")
-            
-        # Estimated time remaining
-        if len(self.epochs) > 1 and hasattr(self, 'total_epochs'):
-            epochs_per_minute = len(self.epochs) / (duration.total_seconds() / 60)
-            remaining_epochs = self.total_epochs - self.epochs[-1]
-            eta_minutes = remaining_epochs / epochs_per_minute
-            eta = datetime.now() + timedelta(minutes=eta_minutes)
-            status_text.append(f"ETA: {eta.strftime('%H:%M:%S')} ({int(eta_minutes)} minutes)")
-            
-        # Display status
-        status_line = " | ".join(status_text)
-        self.ax_status.text(0.5, 0.5, status_line, fontsize=14, 
-                           transform=self.ax_status.transAxes,
-                           ha='center', va='center')
+            status_msg = f"Status: {status_text}"
+            if warnings:
+                status_msg += " | " + " | ".join(warnings)
+                
+            self.ax_status.text(0.5, 0.5, status_msg, ha='center', va='center', 
+                              fontsize=12, color=status_color, weight='bold')
+        else:
+            self.ax_status.text(0.5, 0.5, 'No data available', ha='center', va='center', 
+                              fontsize=12, color='red')
         
-    def run(self):
-        """Start the dashboard animation"""
-        print(f"Starting training dashboard...")
-        print(f"Monitoring: {self.log_dir}")
-        print(f"Update interval: {self.update_interval} seconds")
-        print("Press Ctrl+C to stop")
-        
-        # Create animation
-        ani = FuncAnimation(self.fig, self.update_plots, interval=self.update_interval*1000,
-                          blit=False, cache_frame_data=False)
-        
-        try:
-            plt.show()
-        except KeyboardInterrupt:
-            print("\nDashboard stopped")
-            
+        self.ax_status.axis('off')
 
 def main():
-    parser = argparse.ArgumentParser(description='Kokoro Voice Training Dashboard')
-    parser.add_argument('--log_dir', default='output/audiobook_voice', 
-                       help='Directory containing training logs')
+    parser = argparse.ArgumentParser(description='Monitor Kokoro voice training in real-time')
+    parser.add_argument('--log_dir', type=str, default='output/my_voice',
+                      help='Directory containing training logs')
     parser.add_argument('--update_interval', type=int, default=5,
-                       help='Update interval in seconds')
-    
+                      help='Update interval in seconds')
     args = parser.parse_args()
     
-    dashboard = TrainingDashboard(args.log_dir, args.update_interval)
-    dashboard.run()
+    log_dir = Path(args.log_dir)
+    if not log_dir.exists():
+        print(f"Error: Log directory {log_dir} does not exist")
+        return
     
+    print("Starting training dashboard...")
+    print(f"Monitoring: {log_dir}")
+    print(f"Update interval: {args.update_interval} seconds")
+    print("Press Ctrl+C to stop")
+    
+    # Create dashboard
+    dashboard = TrainingDashboard(log_dir, args.update_interval)
+    
+    # Start animation
+    ani = FuncAnimation(dashboard.fig, dashboard.update_data, 
+                       interval=args.update_interval * 1000,
+                       cache_frame_data=False)
+    
+    plt.show()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

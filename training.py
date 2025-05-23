@@ -864,11 +864,13 @@ def train(
         if epoch % checkpoint_every == 0 or epoch == epochs:
             # Create output directory if it doesn't exist
             os.makedirs(f"{out}/{name}", exist_ok=True)
+            os.makedirs(f"{out}/{name}/checkpoints", exist_ok=True)
             voice_embedding.save(f"{out}/{name}/{name}.epoch{epoch}.pt")
             print(f"✓ Checkpoint saved: {name}.epoch{epoch}.pt")
             
             # Save checkpoint with optimizer and scheduler states
             checkpoint_path = Path(out) / name / "checkpoints" / f"{name}.epoch{epoch}.pt"
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)  # Create directory if it doesn't exist
             checkpoint_data = {
                 'voice_embed': voice_embedding.voice_embed.data.cpu(),
                 'optimizer_state': optim.state_dict(),
@@ -1269,6 +1271,7 @@ if __name__ == "__main__":
 
     # Create output directory structure
     os.makedirs(f"{args.out}/{args.name}", exist_ok=True)
+    os.makedirs(f"{args.out}/{args.name}/checkpoints", exist_ok=True)
     
     train(
         data_root=data_root,
