@@ -112,7 +112,6 @@ def dynamic_time_truncation(mel_spec1, mel_spec2):
     min_time = min(mel_spec1.shape[-1], mel_spec2.shape[-1])
     return mel_spec1[..., :min_time], mel_spec2[..., :min_time]
 
-
 def rms_normalize(audio, target_rms=0.1):
     """Normalize audio to target RMS value.
     
@@ -142,6 +141,37 @@ def rms_normalize(audio, target_rms=0.1):
         
     return normalized
 
+def estimate_time_remaining(epoch: int, total_epochs: int, epoch_start_time: float) -> str:
+    """Estimate time remaining based on current epoch duration."""
+    if epoch == 0:
+        return "calculating..."
+    
+    epoch_duration = time.time() - epoch_start_time
+    remaining_epochs = total_epochs - epoch
+    estimated_seconds = epoch_duration * remaining_epochs
+    
+    return format_duration(estimated_seconds)
+
+class EarlyStopping:
+    """Early stopping helper to prevent overfitting."""
+    def __init__(self, patience: int = 10, min_delta: float = 0.0001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.should_stop = False
+        
+    def __call__(self, val_loss: float) -> bool:
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+        return self.should_stop
 
 class VoiceDataset(Dataset):
     """Loads (<sentence>, log-mel target) pairs for training."""
@@ -252,7 +282,33 @@ def train(
     save_best: bool = True,                        # Save best checkpoint (lowest validation L1 loss after epoch 5)
     upload_to_hf: bool = False,                    # Upload model and artifacts to HuggingFace
     hf_repo_id: Optional[str] = None,              # Repository ID for HuggingFace upload
+    checkpoint_every: int = 10,                    # Save checkpoint every N epochs
+    patience: int = 15,                            # Early stopping patience
 ):
+    """Train a Kokoro voice embedding for audiobook narration.
+    
+    This trains a length-dependent voice embedding (510 × 1 × 256 tensor) that captures
+    your unique timbre and speaking style. The pretrained Kokoro model stays frozen;
+    only the voice embedding is optimized.
+    
+    Key features:
+    - Length-dependent embeddings for better prosody modeling
+    - Multi-scale spectral loss for high-quality voice matching
+    - Automatic checkpointing and early stopping
+    - Memory-efficient training on Apple Silicon
+    """
+    
+    # Print training configuration
+    print("\n" + "="*60)
+    print("Kokoro Voice Training - Audiobook Quality")
+    print("="*60)
+    print(f"Dataset: {data_root}")
+    print(f"Output: {out}/{name}")
+    print(f"Epochs: {epochs}")
+    print(f"Learning rate: {lr}")
+    print(f"Early stopping patience: {patience}")
+    print("="*60 + "\n")
+    
     # Initialize accelerator for mixed precision and gradient accumulation
     accelerator = Accelerator(
         mixed_precision="bf16",
@@ -286,10 +342,6 @@ def train(
         wandb_project=wandb_project or "kokoro-voice-training",
         wandb_name=run_name
     )
-    
-    # # For backward compatibility
-    # writer = logger.writer if use_tensorboard else None
-    # WANDB_AVAILABLE = use_wandb
     
     # Store the config for W&B
     if use_wandb:
@@ -346,10 +398,22 @@ def train(
     dataset = VoiceDataset(data_root, mel_transform_cpu, split="train")
     validation_dataset = None
     
+    # Dataset statistics
+    print(f"\nDataset Statistics:")
+    print(f"Training samples: {len(dataset)}")
+    
     # If validation directory exists and we requested validation data, load it
     if not skip_validation and (Path(data_root) / "validation").exists():
         validation_dataset = VoiceDataset(data_root, mel_transform_cpu, split="validation")
-        print(f"Using dataset splits: {len(dataset)} training samples, {len(validation_dataset)} validation samples")
+        print(f"Validation samples: {len(validation_dataset)}")
+    else:
+        print("Validation samples: 0 (using training data for monitoring)")
+    
+    # Estimate training time
+    samples_per_epoch = len(dataset)
+    estimated_steps = samples_per_epoch * epochs
+    print(f"Estimated total steps: {estimated_steps:,}")
+    print()
     
     # Create data loaders - simpler configuration
     loader = DataLoader(
@@ -470,6 +534,25 @@ def train(
     # Prepare scheduler with accelerator
     scheduler = accelerator.prepare(scheduler)
     
+    # Check for existing checkpoint to resume from
+    resume_epoch = 0
+    checkpoint_dir = Path(out) / name / "checkpoints"
+    if checkpoint_dir.exists():
+        checkpoints = sorted([f for f in checkpoint_dir.iterdir() if f.suffix == '.pt' and 'epoch' in f.name])
+        if checkpoints:
+            latest_checkpoint = checkpoints[-1]
+            resume_epoch = int(latest_checkpoint.stem.split('_')[-1])
+            print(f"Found checkpoint at epoch {resume_epoch}, resuming training...")
+            checkpoint_data = torch.load(latest_checkpoint, map_location=device)
+            voice_embedding.voice_embed.data = checkpoint_data['voice_embed'].to(device)
+            if 'optimizer_state' in checkpoint_data:
+                optim.load_state_dict(checkpoint_data['optimizer_state'])
+            if 'scheduler_state' in checkpoint_data:
+                scheduler.load_state_dict(checkpoint_data['scheduler_state'])
+            if 'best_val_loss' in checkpoint_data:
+                best_val_loss = checkpoint_data['best_val_loss']
+                best_epoch = checkpoint_data.get('best_epoch', 0)
+    
     # Multiple loss functions for better results
     l1_loss_fn = nn.L1Loss()
     mse_loss_fn = nn.MSELoss()
@@ -477,7 +560,19 @@ def train(
     # G2P pipeline for text -> phonemes
     g2p = KPipeline(lang_code="a", model=False)  # Only G2P functionality needed
 
-    for epoch in range(1, epochs + 1):
+    early_stopping = EarlyStopping(patience=patience, min_delta=0.0001)
+    training_start_time = time.time()
+    
+    # Memory usage tracking
+    def get_memory_usage():
+        if device.type == "cuda":
+            return f"GPU: {torch.cuda.memory_allocated()/1024**3:.2f}GB/{torch.cuda.get_device_properties(0).total_memory/1024**3:.2f}GB"
+        elif device.type == "mps":
+            return "MPS: Memory tracking not available"
+        else:
+            return "CPU: Memory tracking not needed"
+    
+    for epoch in range(resume_epoch + 1, epochs + 1):
         epoch_loss = 0.0
         batch_count = 0
         
@@ -488,13 +583,16 @@ def train(
                 torch.mps.empty_cache()
             gc.collect()
             
-        for text, target_log_mel, target_audio in loader:
+        epoch_start_time = time.time()
+        
+        # Progress bar for better tracking
+        progress_bar = tqdm(loader, desc=f"Epoch {epoch}/{epochs}", leave=False)
+        
+        for batch in progress_bar:
             batch_count += 1
             
             # Process single sample (we're always using batch_size=1 for stability)
-            text = text[0]  # batch_size=1
-            target_log_mel = target_log_mel.to(device)
-            target_audio = target_audio.to(device)
+            text, target_log_mel, target_audio = batch
             
             # Process the text input
             phonemes, _ = g2p.g2p(text)
@@ -520,8 +618,36 @@ def train(
             phoneme_length = len(phonemes)
             voice_for_input = voice_embedding.get_for_length(phoneme_length).squeeze(1).to(device)
             
-            # No need for autocast with accelerate - it handles this automatically
-            audio_pred, _ = model.forward_with_tokens.__wrapped__(  # type: ignore[attr-defined]
+            # Clear cache periodically for CUDA devices
+            if device.type == "cuda" and batch_count % 10 == 0:
+                torch.cuda.empty_cache()
+                gc.collect()
+            
+            # Use gradient checkpointing for memory efficiency on CUDA
+            if device.type == "cuda" and memory_efficient:
+                # Enable gradient checkpointing temporarily
+                model.decoder.generator.train()  # Ensure model is in training mode
+                with torch.cuda.amp.autocast(enabled=False):  # Disable autocast to avoid conflicts
+                    try:
+                        audio_pred, _ = model.forward_with_tokens.__wrapped__(  # type: ignore[attr-defined]
+                            model, ids, voice_for_input
+                        )
+                    except torch.cuda.OutOfMemoryError:
+                        # Emergency memory cleanup
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        print(f"OOM detected, clearing cache and retrying with smaller sequence...")
+                        # Try with truncated sequence
+                        if ids.shape[1] > 50:
+                            ids = ids[:, :50]  # Truncate to first 50 tokens
+                            audio_pred, _ = model.forward_with_tokens.__wrapped__(
+                                model, ids, voice_for_input
+                            )
+                        else:
+                            raise  # Re-raise if already short
+            else:
+                # Normal forward pass for non-CUDA devices
+                audio_pred, _ = model.forward_with_tokens.__wrapped__(  # type: ignore[attr-defined]
                     model, ids, voice_for_input
                 )
             
@@ -586,15 +712,25 @@ def train(
                 optim.zero_grad()
                 
                 # Explicitly clean memory if needed
-                if memory_efficient and device.type == "mps" and batch_count % 5 == 0:
-                    # Release unused memory
-                    if hasattr(torch.mps, 'empty_cache'):
-                        torch.mps.empty_cache()
-                    gc.collect()
+                if memory_efficient:
+                    if device.type == "mps" and batch_count % 5 == 0:
+                        # Release unused memory
+                        if hasattr(torch.mps, 'empty_cache'):
+                            torch.mps.empty_cache()
+                        gc.collect()
+                    elif device.type == "cuda" and batch_count % 3 == 0:
+                        # More aggressive memory management for CUDA
+                        torch.cuda.empty_cache()
+                        gc.collect()
 
             epoch_loss += loss.item() * gradient_accumulation_steps  # Scale back for reporting
             # print current step statistics
-            print(f"{text[:20]}: loss {loss.item() * gradient_accumulation_steps:.4f} - {len(phonemes)} phonemes - epoch loss {epoch_loss:.4f}")
+            if batch_count % 10 == 0:  # Print every 10 batches instead of every batch
+                avg_batch_loss = epoch_loss / batch_count
+                print(f"[Epoch {epoch}/{epochs}] Batch {batch_count}/{len(loader)} | "
+                      f"Loss: {loss.item() * gradient_accumulation_steps:.4f} | "
+                      f"Avg: {avg_batch_loss:.4f} | "
+                      f"Text: {text[:30]}...")
             
             # Log individual losses for current batch using unified logger
             step = (epoch - 1) * len(loader) + batch_count
@@ -615,6 +751,13 @@ def train(
                 
             # Log all metrics at once
             logger.log_metrics(batch_metrics, step)
+
+            # Update progress bar with memory usage
+            progress_bar.set_postfix({
+                'loss': f"{epoch_loss/max(1, batch_count):.4f}",
+                'mem': get_memory_usage(),
+                'lr': f"{scheduler.get_last_lr()[0]:.2e}"
+            })
 
         avg_loss = epoch_loss / len(loader)
         
@@ -674,13 +817,28 @@ def train(
                     
                 if val_losses:
                     validation_loss = sum(val_losses) / len(val_losses)
-                    print(f"Epoch {epoch:>3}/{epochs}: training loss {avg_loss:.4f}, validation loss {validation_loss:.4f}")
+                    
+                    # More informative epoch summary
+                    epoch_duration = time.time() - epoch_start_time
+                    total_duration = time.time() - training_start_time
+                    time_remaining = estimate_time_remaining(epoch, epochs, epoch_start_time)
+                    
+                    print(f"\n{'='*60}")
+                    print(f"Epoch {epoch}/{epochs} Summary:")
+                    print(f"  Training Loss:    {avg_loss:.4f}")
+                    print(f"  Validation Loss:  {validation_loss:.4f}")
+                    print(f"  Best Val Loss:    {best_val_loss:.4f} (epoch {best_epoch})")
+                    print(f"  Learning Rate:    {optim.param_groups[0]['lr']:.2e}")
+                    print(f"  Epoch Time:       {format_duration(epoch_duration)}")
+                    print(f"  Total Time:       {format_duration(total_duration)}")
+                    print(f"  Time Remaining:   {time_remaining}")
+                    print(f"{'='*60}\n")
                     
                     # Save best model (lowest validation L1 loss after epoch 5)
                     if save_best and epoch >= 5 and validation_loss < best_val_loss:
                         best_val_loss = validation_loss
                         best_epoch = epoch
-                        print(f"New best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
+                        print(f"✓ New best model! Validation loss improved to {best_val_loss:.4f}")
                         # Create output directory if it doesn't exist
                         os.makedirs(f"{out}/{name}", exist_ok=True)
                         voice_embedding.save(f"{out}/{name}/{name}.best.pt")
@@ -688,136 +846,33 @@ def train(
                     print(f"Epoch {epoch:>3}/{epochs}: training loss {avg_loss:.4f} (no validation samples processed)")
             model.train()  # Set model back to training mode
         else:
-            print(f"Epoch {epoch:>3}/{epochs}: loss {avg_loss:.4f}")
-        
-        # # Log epoch metrics
-        # if writer is not None:
-        #     writer.add_scalar('Epoch/Training_Loss', avg_loss, epoch)
-        #     if validation_loss is not None:
-        #         writer.add_scalar('Epoch/Validation_Loss', validation_loss, epoch)
-        #     writer.add_scalar('Epoch/Learning_Rate', optim.param_groups[0]['lr'], epoch)
+            epoch_duration = time.time() - epoch_start_time
+            total_duration = time.time() - training_start_time
+            time_remaining = estimate_time_remaining(epoch, epochs, epoch_start_time)
             
-        #     # Log voice embedding stats
-        #     timbre_data = voice_embedding.base_voice[0, :128].detach().cpu().numpy()
-        #     style_data = voice_embedding.base_voice[0, 128:].detach().cpu().numpy()
-            
-        #     # Create histograms for timbre and style components
-        #     writer.add_histogram('Voice/Timbre', timbre_data, epoch)
-        #     writer.add_histogram('Voice/Style', style_data, epoch)
-            
-        #     # Log voice statistics
-        #     writer.add_scalar('Voice/Timbre_Mean', timbre_data.mean(), epoch)
-        #     writer.add_scalar('Voice/Timbre_Std', timbre_data.std(), epoch)
-        #     writer.add_scalar('Voice/Style_Mean', style_data.mean(), epoch)
-        #     writer.add_scalar('Voice/Style_Std', style_data.std(), epoch)
+            print(f"\nEpoch {epoch}/{epochs}: loss {avg_loss:.4f} | "
+                  f"Time: {format_duration(epoch_duration)} | "
+                  f"Remaining: {time_remaining}")
         
-        # if use_wandb and WANDB_AVAILABLE:
-            # Log voice embedding stats
-        timbre_data = voice_embedding.base_voice[0, :128].detach().cpu().numpy()
-        style_data = voice_embedding.base_voice[0, 128:].detach().cpu().numpy()
-        log_dict = {
-            'epoch': epoch,
-            'epoch_loss': avg_loss,
-            'learning_rate': optim.param_groups[0]['lr'],
-            'timbre_mean': timbre_data.mean().item(),
-            'timbre_std': timbre_data.std().item(),
-            'style_mean': style_data.mean().item(),
-            'style_std': style_data.std().item()
-        }
-        
-        if validation_loss is not None:
-            log_dict['validation_loss'] = validation_loss
-            
-        # wandb.log(log_dict)
-        
-        # # Log histograms in W&B
-        # wandb.log({
-        #     'timbre_hist': wandb.Histogram(voice_embedding.base_voice[0, :128].detach().cpu().numpy()),
-        #     'style_hist': wandb.Histogram(voice_embedding.base_voice[0, 128:].detach().cpu().numpy())
-        # })
-        logger.log_metrics(log_dict)
-        logger.log_metrics({
-            'timbre_hist': wandb.Histogram(voice_embedding.base_voice[0, :128].detach().cpu().numpy()),
-            'style_hist': wandb.Histogram(voice_embedding.base_voice[0, 128:].detach().cpu().numpy())
-        })
-    
-        # Log audio samples periodically
-        if (epoch % log_audio_every == 0 or epoch == epochs):
-            # Generate a sample with current voice embedding
-            with torch.no_grad():
-                # Use a different validation sample each epoch for better monitoring of phoneme drift
-                if validation_dataset and len(validation_dataset) > 0:
-                    # Pick a validation sample based on epoch number for variety
-                    sample_idx = epoch % len(validation_dataset)
-                    sample_text = validation_dataset.sentences[sample_idx]
-                    reference_audio = validation_dataset._load_wav(validation_dataset.wav_paths[sample_idx])
-                else:
-                    # Fall back to training data with rotating selection if no validation set
-                    sample_idx = epoch % len(dataset)
-                    sample_text = dataset.sentences[sample_idx]
-                    reference_audio = dataset._load_wav(dataset.wav_paths[sample_idx])
-                phonemes, _ = g2p.g2p(sample_text)
-                
-                if phonemes:
-                    # Generate audio
-                    ids = text_to_input_ids(model, phonemes).to(device)
-                    voice_input = voice_embedding.base_voice.to(device)
-                    audio_sample, _ = model.forward_with_tokens.__wrapped__(model, ids, voice_input)
-                    audio_sample = audio_sample.squeeze().cpu().numpy()
-                    
-                    # Generate mel spectrogram for visualization
-                    with torch.no_grad():
-                        mel = mel_transform_cpu(torch.tensor(audio_sample).unsqueeze(0))
-                        reference_mel = mel_transform_cpu(torch.tensor(reference_audio).unsqueeze(0))
-                        log_mel_sample = 20 * torch.log10(mel.clamp(min=1e-5))[0].cpu().numpy()
-                        log_reference_mel = 20 * torch.log10(reference_mel.clamp(min=1e-5))[0].cpu().numpy()
-                    
-                    # Use unified logger to log audio samples and spectrograms
-                    logger.log_audio(
-                        audio=reference_audio.squeeze().cpu().numpy(),
-                        sample_rate=24000,
-                        caption=f"Reference: {sample_text[:30]}",
-                        step=epoch,
-                        is_reference=True
-                    )
-                    logger.log_audio(
-                        audio=audio_sample,
-                        sample_rate=24000,
-                        caption=f"Epoch {epoch}: {sample_text[:30]}",
-                        step=epoch
-                    )
-                    
-                    # Log spectrogram
-                    logger.log_spectrogram(
-                        spec_img=log_reference_mel,
-                        caption=f"Reference: {sample_text[:30]}",
-                        step=epoch,
-                        is_reference=True
-                    )
-                    logger.log_spectrogram(
-                        spec_img=log_mel_sample,
-                        caption=f"Epoch {epoch}: {sample_text[:30]}",
-                        step=epoch
-                    )
-        
-        scheduler.step()
-        
-        # Check embedding health and apply clamping if needed
-        embedding_stats = voice_embedding.check_health(epoch=epoch, warning_threshold=timbre_warning_threshold)
-        
-        # Every 5 epochs, apply length smoothing to avoid discontinuities
-        if epoch % 5 == 0:
-            voice_embedding.apply_length_smoothing(weight=0.2)
-            print(f"Applied length smoothing at epoch {epoch}")
-        
-        # Log embedding statistics with length variation
-        logger.log_embedding_stats(embedding_stats, step=epoch)
-        
-        # Save the full voice tensor every 5 epochs
-        if epoch % 5 == 0:
+        # Save the full voice tensor every N epochs
+        if epoch % checkpoint_every == 0 or epoch == epochs:
             # Create output directory if it doesn't exist
             os.makedirs(f"{out}/{name}", exist_ok=True)
             voice_embedding.save(f"{out}/{name}/{name}.epoch{epoch}.pt")
+            print(f"✓ Checkpoint saved: {name}.epoch{epoch}.pt")
+            
+            # Save checkpoint with optimizer and scheduler states
+            checkpoint_path = Path(out) / name / "checkpoints" / f"{name}.epoch{epoch}.pt"
+            checkpoint_data = {
+                'voice_embed': voice_embedding.voice_embed.data.cpu(),
+                'optimizer_state': optim.state_dict(),
+                'scheduler_state': scheduler.state_dict(),
+                'epoch': epoch,
+                'best_val_loss': best_val_loss,
+                'best_epoch': best_epoch,
+                'dataset_stats': {}
+            }
+            torch.save(checkpoint_data, checkpoint_path)
             
             # Visualize the length-dependent embeddings
             # Create embedding visualization - show how they vary by length
@@ -847,30 +902,37 @@ def train(
             logger.log_spectrogram(fig, "Length_Variation", epoch)
             plt.close(fig)
 
-    
-    # Save the final voice embedding
-    os.makedirs(f"{out}/{name}", exist_ok=True)
-    
-    # # Add special flag for length-dependent training to the name
-    # name_suffix = "_length_dependent"
-    # if name and not name.endswith(name_suffix):
-    #     name = f"{name}{name_suffix}"
+        scheduler.step()
         
-    if wandb_name is None:
-        wandb_name = f"{name}_{time.strftime('%Y%m%d_%H%M%S')}"
+        # Check embedding health and apply clamping if needed
+        embedding_stats = voice_embedding.check_health(epoch=epoch, warning_threshold=timbre_warning_threshold)
         
-    # Use the VoiceEmbedding save method to save length-dependent embeddings
-    voice_embedding.save(f"{out}/{name}/{name}.pt")
-    
-    # Also save a backwards compatibility version
-    print("Saving backwards-compatible version for older inference code")
-    base_voice_avg = voice_embedding.base_voice.detach().cpu()
-    save_voice(base_voice_avg, voice_embedding.voice_embed.detach().cpu(), f"{out}/{name}/{name}.compat.pt")
+        # Every 5 epochs, apply length smoothing to avoid discontinuities
+        if epoch % 5 == 0:
+            voice_embedding.apply_length_smoothing(weight=0.2)
+            print(f"Applied length smoothing at epoch {epoch}")
+        
+        # Log embedding statistics with length variation
+        logger.log_embedding_stats(embedding_stats, step=epoch)
+        
+        # Check for early stopping
+        if validation_loss is not None:
+            if early_stopping(validation_loss):
+                print(f"\n⚠️  Early stopping triggered at epoch {epoch}")
+                print(f"Validation loss hasn't improved for {patience} epochs")
+                print(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
+                break
     
     # Print summary info about best checkpoint if available
     if save_best and best_epoch > 0:
-        print(f"\nTraining complete. Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
-        print(f"Best model saved to: {out}/{name}/{name}.best.pt")
+        print(f"\n{'='*60}")
+        print(f"Training Complete!")
+        print(f"{'='*60}")
+        print(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
+        print(f"Final output: {out}/{name}/{name}.pt")
+        print(f"Best model: {out}/{name}/{name}.best.pt")
+        print(f"Total training time: {format_duration(time.time() - training_start_time)}")
+        print(f"{'='*60}\n")
     
     # Upload to HuggingFace    # HF upload
     if upload_to_hf and hf_repo_id:

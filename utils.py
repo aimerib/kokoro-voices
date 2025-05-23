@@ -4,9 +4,53 @@ Utility classes for Kokoro Voices training
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from torchaudio.functional import spectrogram
 from typing import Dict, List, Optional, Tuple, Union, Any
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+import os
+
+def apply_audio_augmentations(audio: torch.Tensor, sample_rate: int = 24000, training: bool = True) -> torch.Tensor:
+    """Apply subtle augmentations to audio for better generalization.
+    
+    Args:
+        audio: Audio tensor [batch, samples] or [samples]
+        sample_rate: Audio sample rate
+        training: Whether to apply augmentations (disabled during validation)
+    
+    Returns:
+        Augmented audio tensor
+    """
+    if not training:
+        return audio
+        
+    # Ensure 2D
+    is_1d = audio.dim() == 1
+    if is_1d:
+        audio = audio.unsqueeze(0)
+    
+    # 1. Subtle pitch shift (±2%)
+    if torch.rand(1).item() < 0.3:
+        shift_factor = 0.98 + torch.rand(1).item() * 0.04
+        audio = F.interpolate(audio.unsqueeze(1), scale_factor=shift_factor, mode='linear', align_corners=False).squeeze(1)
+    
+    # 2. Very subtle time stretching (±1%)
+    if torch.rand(1).item() < 0.2:
+        stretch_factor = 0.99 + torch.rand(1).item() * 0.02
+        audio = F.interpolate(audio.unsqueeze(1), scale_factor=stretch_factor, mode='linear', align_corners=False).squeeze(1)
+    
+    # 3. Subtle volume variation (±5%)
+    if torch.rand(1).item() < 0.5:
+        volume_factor = 0.95 + torch.rand(1).item() * 0.1
+        audio = audio * volume_factor
+    
+    if is_1d:
+        audio = audio.squeeze(0)
+        
+    return audio
 
 
 class VoiceLoss(nn.Module):
