@@ -171,7 +171,10 @@ class TrainingLogger:
             
         if self.use_wandb:
             import wandb
-            wandb.log({f"spectrogram_epoch_{step}": wandb.Image(fig)})
+            if step == 0:
+                wandb.log({"Reference Spectrogram": wandb.Image(fig)})
+            else:
+                wandb.log({f"spectrogram_epoch_{step}": wandb.Image(fig)})
             
         plt.close(fig)
     

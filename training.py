@@ -761,26 +761,26 @@ def train(
                     
                     # Use unified logger to log audio samples and spectrograms
                     logger.log_audio(
+                        audio=reference_audio.squeeze().cpu().numpy(),
+                        sample_rate=24000,
+                        caption=f"Reference: {sample_text[:30]}",
+                        step=epoch
+                    )
+                    logger.log_audio(
                         audio=audio_sample,
                         sample_rate=24000,
                         caption=f"Epoch {epoch}: {sample_text[:30]}",
                         step=epoch
                     )
-                    logger.log_audio(
-                        audio=reference_audio.squeeze().cpu().numpy(),
-                        sample_rate=24000,
-                        caption=f"Epoch {epoch}: {sample_text[:30]} (reference)",
-                        step=epoch
-                    )
                     
                     # Log spectrogram
                     logger.log_spectrogram(
-                        spec_img=log_mel_sample,
-                        caption=f"Epoch {epoch}: {sample_text[:30]}",
-                        step=epoch
+                        spec_img=log_reference_mel,
+                        caption=f"Reference: {sample_text[:30]}",
+                        step=0
                     )
                     logger.log_spectrogram(
-                        spec_img=log_reference_mel,
+                        spec_img=log_mel_sample,
                         caption=f"Epoch {epoch}: {sample_text[:30]}",
                         step=epoch
                     )
@@ -836,10 +836,10 @@ def train(
     # Save the final voice embedding
     os.makedirs(f"{out}/{name}", exist_ok=True)
     
-    # Add special flag for length-dependent training to the name
-    name_suffix = "_length_dependent"
-    if name and not name.endswith(name_suffix):
-        name = f"{name}{name_suffix}"
+    # # Add special flag for length-dependent training to the name
+    # name_suffix = "_length_dependent"
+    # if name and not name.endswith(name_suffix):
+    #     name = f"{name}{name_suffix}"
         
     if wandb_name is None:
         wandb_name = f"{name}_{time.strftime('%Y%m%d_%H%M%S')}"
