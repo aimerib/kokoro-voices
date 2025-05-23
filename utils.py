@@ -130,7 +130,7 @@ class TrainingLogger:
             if not wandb.run:
                 wandb.init(project=wandb_project, name=wandb_name)
     
-    def log_metrics(self, metrics, step):
+    def log_metrics(self, metrics, step=None):
         """Log scalar metrics to both TensorBoard and W&B"""
         if self.writer:
             for k, v in metrics.items():
@@ -138,7 +138,7 @@ class TrainingLogger:
                 
         if self.use_wandb:
             import wandb
-            wandb.log(metrics, step=step)
+            wandb.log(metrics, step=step or wandb.run.step)
     
     def log_audio(self, audio, sample_rate, caption, step, is_reference=False):
         """Log audio sample to both platforms"""
