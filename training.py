@@ -429,14 +429,6 @@ def train(
             shuffle=False
         )
 
-    # ---------------------------------------------------------------------
-    # Model + voice embedding
-    # ---------------------------------------------------------------------
-    # model = KModel().to(device).eval()
-    model = KModel().train()  # Accelerator will handle device placement
-    for p in model.parameters():
-        p.requires_grad_(False)
-
     # Initialize a full 3D voice tensor [510, 1, 256] to match Kokoro's expected format
     voice_embed = torch.zeros((MAX_PHONEME_LEN, 1, 256), device=device)
     
@@ -547,6 +539,7 @@ def train(
     mse_loss_fn = nn.MSELoss()
 
     # G2P pipeline for text -> phonemes
+    # Initialize on CPU to avoid device conflicts, G2P doesn't need GPU
     g2p = KPipeline(lang_code="a", model=False)  # Only G2P functionality needed
 
     early_stopping = EarlyStopping(patience=patience, min_delta=0.0001)
@@ -590,9 +583,20 @@ def train(
             target_audio = target_audio.to(device)
             
             # Process the text input
-            phonemes, _ = g2p.g2p(text)
+            try:
+                phonemes, _ = g2p.g2p(text)
+            except Exception as e:
+                print(f"G2P processing failed for text '{text[:50]}...': {e}")
+                continue
+                
             if phonemes is None or len(phonemes) == 0:
+                print(f"Skipping empty phoneme sequence for text: '{text[:50]}...'")
                 continue  # skip un-tokenisable utterance
+                
+            # Validate phoneme length to prevent memory issues
+            if len(phonemes) > MAX_PHONEME_LEN:
+                print(f"Skipping too long phoneme sequence ({len(phonemes)} > {MAX_PHONEME_LEN}): '{text[:50]}...'")
+                continue
                 
             # Convert to input IDs and validate
             ids = text_to_input_ids(model, phonemes).to(device)
@@ -601,11 +605,16 @@ def train(
             if ids.shape[1] < 3:
                 print(f"Skipping too short phoneme sequence: '{phonemes}'")
                 continue
+            
+            # Validate audio length to prevent memory issues
+            if target_audio.shape[-1] > 24000 * 30:  # 30 seconds max
+                print(f"Skipping too long audio ({target_audio.shape[-1]/24000:.1f}s > 30s): '{text[:50]}...'")
+                continue
 
             # With length-dependent embeddings, we'll select the appropriate embedding
             # based on the phoneme sequence length - this happens later
                 
-            # Forward pass – call the *undecorated* version to retain gradients
+            # Forward pass – call the standard method to retain gradients
             # Ensure all inputs are on the same device as the model
             ids = ids.to(device)
             
@@ -621,12 +630,9 @@ def train(
             # Use gradient checkpointing for memory efficiency on CUDA
             if device.type == "cuda" and memory_efficient:
                 # Enable gradient checkpointing temporarily
-                model.decoder.generator.train()  # Ensure model is in training mode
-                with torch.cuda.amp.autocast(enabled=False):  # Disable autocast to avoid conflicts
+                with torch.amp.autocast('cuda', enabled=False):  # Disable autocast to avoid conflicts
                     try:
-                        audio_pred, _ = model.forward_with_tokens.__wrapped__(  # type: ignore[attr-defined]
-                            model, ids, voice_for_input
-                        )
+                        audio_pred, _ = model.forward_with_tokens(ids, voice_for_input)
                     except torch.cuda.OutOfMemoryError:
                         # Emergency memory cleanup
                         torch.cuda.empty_cache()
@@ -635,16 +641,12 @@ def train(
                         # Try with truncated sequence
                         if ids.shape[1] > 50:
                             ids = ids[:, :50]  # Truncate to first 50 tokens
-                            audio_pred, _ = model.forward_with_tokens.__wrapped__(
-                                model, ids, voice_for_input
-                            )
+                            audio_pred, _ = model.forward_with_tokens(ids, voice_for_input)
                         else:
                             raise  # Re-raise if already short
             else:
                 # Normal forward pass for non-CUDA devices
-                audio_pred, _ = model.forward_with_tokens.__wrapped__(  # type: ignore[attr-defined]
-                    model, ids, voice_for_input
-                )
+                audio_pred, _ = model.forward_with_tokens(ids, voice_for_input)
             
             # Make sure prediction is on the correct device
             if audio_pred.device != device:
@@ -689,11 +691,12 @@ def train(
             stft_loss = loss_components['stft_loss']
             style_reg_loss = loss_components['style_reg_loss']
             
-            # Target statistics for health checks
-            timbre_mean = voice_embedding.timbre_mean
-            timbre_std = voice_embedding.timbre_std
-            style_mean = voice_embedding.style_mean
-            style_std = voice_embedding.style_std
+            # Get current embedding statistics for health monitoring
+            embedding_stats = voice_embedding.get_embedding_stats()
+            timbre_mean = embedding_stats["timbre_mean"]
+            timbre_std = embedding_stats["timbre_std"]
+            style_mean = embedding_stats["style_mean"]
+            style_std = embedding_stats["style_std"]
             
             # Add length smoothness regularization to prevent abrupt changes between lengths
             smoothness_loss = voice_embedding.calculate_smoothness_loss(weight=0.005)
@@ -748,7 +751,8 @@ def train(
                 'timbre_mean': timbre_mean,
                 'timbre_std': timbre_std,
                 'style_mean': style_mean,
-                'style_std': style_std   
+                'style_std': style_std,
+                'length_variation': embedding_stats["length_variation"]
             }
             
             if style_regularization is not None and style_regularization > 0:
@@ -778,13 +782,25 @@ def train(
                     # We don't need val_target_audio for validation loss, but unpack it to match dataset format
                     
                     # Process text
-                    phonemes, _ = g2p.g2p(val_text)
+                    try:
+                        phonemes, _ = g2p.g2p(val_text)
+                    except Exception as e:
+                        print(f"G2P processing failed for text '{val_text[:50]}...': {e}")
+                        continue
+                        
                     if phonemes is None or len(phonemes) == 0:
+                        print(f"Skipping empty validation phoneme sequence for text: '{val_text[:50]}...'")
+                        continue
+                    
+                    # Validate phoneme length for validation as well
+                    if len(phonemes) > MAX_PHONEME_LEN:
+                        print(f"Skipping too long validation phoneme sequence ({len(phonemes)} > {MAX_PHONEME_LEN}): '{val_text[:50]}...'")
                         continue
                     
                     # Convert phonemes to input IDs
                     val_ids = text_to_input_ids(model, phonemes).to(device)
                     if val_ids.shape[1] < 3:
+                        print(f"Skipping too short validation phoneme sequence: '{phonemes}'")
                         continue
                     
                     # Generate audio - ensure all inputs are on the same device
@@ -794,7 +810,11 @@ def train(
                     val_phoneme_length = len(phonemes)
                     voice_input = voice_embedding.get_for_length(val_phoneme_length).squeeze(1).to(device)
                     
-                    val_audio_pred, _ = model.forward_with_tokens.__wrapped__(model, val_ids, voice_input)
+                    # Use unwrapped model to avoid accelerator overhead during validation
+                    if hasattr(model, 'module'):
+                        val_audio_pred, _ = model.module.forward_with_tokens(val_ids, voice_input)
+                    else:
+                        val_audio_pred, _ = model.forward_with_tokens(val_ids, voice_input)
                     
                     # Normalize prediction before Mel conversion
                     val_normalized_pred = rms_normalize(val_audio_pred)
@@ -818,6 +838,19 @@ def train(
                     # Compute loss
                     val_loss = l1_loss_fn(val_pred_for_loss, val_target_for_loss)
                     val_losses.append(val_loss.item())
+                    
+                    # Explicit cleanup for validation
+                    del val_audio_pred, val_normalized_pred, val_pred_mel, val_pred_log_mel
+                    del val_pred_for_loss, val_target_for_loss, val_loss
+                    
+                    # Force memory cleanup every few validation samples
+                    if len(val_losses) % 5 == 0:
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        elif device.type == "mps":
+                            if hasattr(torch.mps, 'empty_cache'):
+                                torch.mps.empty_cache()
+                        gc.collect()
                     
                 if val_losses:
                     validation_loss = sum(val_losses) / len(val_losses)
@@ -856,12 +889,10 @@ def train(
             print(f"\nEpoch {epoch}/{epochs}: loss {avg_loss:.4f} | "
                   f"Time: {format_duration(epoch_duration)} | "
                   f"Remaining: {time_remaining}")
-        model.train()  # Set model back to training mode
         
         # Log audio samples and spectrograms every N epochs for monitoring convergence
         if epoch % log_audio_every == 0:
             print(f"\n🎵 Logging audio samples for epoch {epoch}...")
-            model.eval()
             
             # Use a sample from the dataset for comparison
             with torch.no_grad():
@@ -870,7 +901,12 @@ def train(
                 sample_text, sample_target_log_mel, sample_target_audio = dataset[sample_idx]
                 
                 # Process the sample text
-                sample_phonemes, _ = g2p.g2p(sample_text)
+                try:
+                    sample_phonemes, _ = g2p.g2p(sample_text)
+                except Exception as e:
+                    print(f"G2P processing failed for text '{sample_text[:50]}...': {e}")
+                    continue
+                    
                 if sample_phonemes and len(sample_phonemes) > 0:
                     sample_ids = text_to_input_ids(model, sample_phonemes).to(device)
                     
@@ -879,7 +915,7 @@ def train(
                         sample_phoneme_length = len(sample_phonemes)
                         sample_voice_input = voice_embedding.get_for_length(sample_phoneme_length).squeeze(1).to(device)
                         
-                        sample_audio_pred, _ = model.forward_with_tokens.__wrapped__(model, sample_ids, sample_voice_input)
+                        sample_audio_pred, _ = model.forward_with_tokens(sample_ids, sample_voice_input)
                         sample_normalized_pred = rms_normalize(sample_audio_pred)
                         
                         # Convert to mel spectrograms for comparison
@@ -952,9 +988,6 @@ def train(
                         print(f"✓ Audio samples logged for epoch {epoch}")
                         print(f"  Sample text: {sample_text[:60]}...")
                         print(f"  Phoneme length: {sample_phoneme_length}")
-                
-            model.train()  # Set model back to training mode
-        
         # Save the full voice tensor every N epochs
         if epoch % checkpoint_every == 0 or epoch == epochs:
             # Create output directory if it doesn't exist
