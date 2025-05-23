@@ -138,7 +138,7 @@ class TrainingLogger:
                 
         if self.use_wandb:
             import wandb
-            wandb.log(metrics, step=step or wandb.run.step)
+            wandb.log(metrics)
     
     def log_audio(self, audio, sample_rate, caption, step, is_reference=False):
         """Log audio sample to both platforms"""
