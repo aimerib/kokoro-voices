@@ -925,7 +925,7 @@ def train(
                         plt.tight_layout()
                         
                         # Log the comparison spectrogram
-                        logger.log_spectrogram(fig, f"Comparison_Epoch_{epoch}", epoch)
+                        logger.log_spectrogram(fig, f"Comparison_Epoch_{epoch}")
                         plt.close(fig)
                         
                         # Log audio samples (move to CPU and convert to numpy for logging)
@@ -1002,7 +1002,7 @@ def train(
             ax2.set_ylabel("Average Activation")
             
             plt.tight_layout()
-            logger.log_spectrogram(fig, "Length_Variation", epoch)
+            logger.log_spectrogram(fig, "Length_Variation")
             plt.close(fig)
 
         scheduler.step()
@@ -1016,7 +1016,7 @@ def train(
             print(f"Applied length smoothing at epoch {epoch}")
         
         # Log embedding statistics with length variation
-        logger.log_embedding_stats(embedding_stats, step=epoch)
+        logger.log_embedding_stats(embedding_stats)
         
         # Check for early stopping
         if validation_loss is not None:
