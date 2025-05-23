@@ -371,10 +371,52 @@ def train(
         # Download the pretrained model weights
         model_path = hf_hub_download(repo_id='hexgrad/Kokoro-82M', filename='kokoro-v1_0.pth')
         
-        # Load the state dict
-        state_dict = torch.load(model_path, map_location='cpu')
-        model.load_state_dict(state_dict, strict=True)
-        print("Loaded pretrained Kokoro weights successfully")
+        # Load the checkpoint which contains the full model
+        checkpoint = torch.load(model_path, map_location='cpu')
+        
+        # The checkpoint contains separate components
+        if isinstance(checkpoint, dict) and 'bert' in checkpoint:
+            # Create a unified state dict from all components
+            state_dict = {}
+            
+            # Process each component
+            for component_name in ['bert', 'predictor', 'decoder', 'text_encoder']:
+                if component_name in checkpoint:
+                    component_dict = checkpoint[component_name]
+                    for key, value in component_dict.items():
+                        # Remove 'module.' prefix if present (from DataParallel)
+                        new_key = key.replace('module.', '')
+                        # Add component prefix if not already there
+                        if not new_key.startswith(component_name + '.'):
+                            new_key = f"{component_name}.{new_key}"
+                        state_dict[new_key] = value
+            
+            # Handle bert_encoder separately as it maps to a different key
+            if 'bert_encoder' in checkpoint:
+                # bert_encoder is a simple linear layer with weight and bias
+                bert_encoder_dict = checkpoint['bert_encoder']
+                for key, value in bert_encoder_dict.items():
+                    # Map directly without module prefix
+                    clean_key = key.replace('module.', '')
+                    if clean_key in ['weight', 'bias']:
+                        state_dict[f"bert_encoder.{clean_key}"] = value
+            
+            # Load the processed state dict
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            
+            if missing_keys:
+                print(f"⚠️  Warning: {len(missing_keys)} keys are missing from checkpoint")
+                # Only show first few missing keys to avoid clutter
+                print(f"   First missing keys: {missing_keys[:5]}")
+                
+            if unexpected_keys:
+                print(f"⚠️  Warning: {len(unexpected_keys)} unexpected keys in checkpoint")
+                print(f"   First unexpected keys: {unexpected_keys[:5]}")
+                
+            print("✓ Loaded pretrained Kokoro weights (non-strict mode)")
+        else:
+            raise ValueError("Unexpected checkpoint format")
+            
     except Exception as e:
         print(f"ERROR: Failed to load pretrained weights: {e}")
         print("The model MUST have pretrained weights to generate speech!")
@@ -473,7 +515,7 @@ def train(
                         noise = torch.randn_like(ref_voice) * 0.05
                         voice_embedding.voice_embed[i, 0, :] = ref_voice + noise
                         
-                print("✓ Initialized from reference voice with variations")
+                print("Initialized from reference voice with variations")
         except Exception as e:
             print(f"Could not download reference voice: {e}")
     except Exception as e:
@@ -1141,10 +1183,9 @@ def train(
             "learning_rate": lr,
             "n_mels": n_mels,
             "n_fft": n_fft,
-            "hop": hop,
-            "style_regularization": style_regularization,
-            "timbre_warning_threshold": timbre_warning_threshold,
-            "hf_repo_id": hf_repo_id,
+            "hop_length": hop,
+            "output": out,
+            "data_root": str(data_root),
         }
         
         # Collect audio samples
