@@ -961,7 +961,7 @@ def train(
                         plt.tight_layout()
                         
                         # Log the comparison spectrogram
-                        logger.log_spectrogram(fig, f"Comparison_Epoch_{epoch}")
+                        logger.log_spectrogram(fig, f"Comparison_Epoch_{epoch}", epoch)
                         plt.close(fig)
                         
                         # Log audio samples (move to CPU and convert to numpy for logging)
@@ -1035,7 +1035,7 @@ def train(
             ax2.set_ylabel("Average Activation")
             
             plt.tight_layout()
-            logger.log_spectrogram(fig, "Length_Variation")
+            logger.log_spectrogram(fig, "Length_Variation", epoch)
             plt.close(fig)
 
         scheduler.step()
