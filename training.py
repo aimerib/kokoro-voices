@@ -594,6 +594,12 @@ def train(
             # Process single sample (we're always using batch_size=1 for stability)
             text, target_log_mel, target_audio = batch
             
+            # Extract first element since we're using batch_size=1
+            if isinstance(text, (list, tuple)):
+                text = text[0]
+            target_log_mel = target_log_mel.to(device)
+            target_audio = target_audio.to(device)
+            
             # Process the text input
             phonemes, _ = g2p.g2p(text)
             if phonemes is None or len(phonemes) == 0:

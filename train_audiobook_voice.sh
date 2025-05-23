@@ -6,23 +6,24 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
 
 # Training configuration optimized for audiobook narration
-python training.py \
+accelerate launch \
+    --mixed_precision no \
+    --num_processes 1 \
+    --num_machines 1 \
+    training.py \
     --data ./datasets/your_voice \
     --name audiobook_voice \
     --epochs 50 \
     --lr 1e-4 \
-    --batch_size 1 \
-    --gradient_accumulation_steps 4 \
-    --log_audio_every 5 \
-    --checkpoint_every 5 \
-    --patience 15 \
-    --save_best \
-    --memory_efficient \
-    --style_regularization 1e-5 \
-    --timbre_warning_threshold 0.35 \
-    --use_wandb \
-    --wandb_project "audiobook-voices" \
-    --wandb_name "$(date +%Y%m%d_%H%M%S)_audiobook" \
+    --batch-size 1 \
+    --grad-accumulation 4 \
+    --log-audio-every 5 \
+    --memory-efficient \
+    --style-reg 1e-5 \
+    --timbre-warning 0.35 \
+    --wandb \
+    --wandb-project "audiobook-voices" \
+    --wandb-name "$(date +%Y%m%d_%H%M%S)_audiobook" \
     2>&1 | tee training.log
 
 # After training, test the voice
