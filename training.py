@@ -428,12 +428,6 @@ def train(
             batch_size=1,
             shuffle=False
         )
-        
-    # Effective batch size is handled by accelerator's gradient_accumulation_steps
-    effective_batch_size = batch_size
-    if effective_batch_size > 1:
-        print(f"Using effective batch size of {effective_batch_size} through gradient accumulation")
-        # Note: accelerator was already initialized with this value
 
     # ---------------------------------------------------------------------
     # Model + voice embedding
@@ -497,11 +491,6 @@ def train(
     print("Using length-dependent voice embeddings!")
     print(f"Total trainable parameters: {voice_embed.numel():,d}")
     
-    # Target statistics for health checks
-    timbre_mean = voice_embedding.timbre_mean
-    timbre_std = voice_embedding.timbre_std
-    style_mean = voice_embedding.style_mean
-    style_std = voice_embedding.style_std
 
     # Set up optimizer with weight decay for regularization
     # Now we optimize all length-dependent embeddings
@@ -700,6 +689,12 @@ def train(
             stft_loss = loss_components['stft_loss']
             style_reg_loss = loss_components['style_reg_loss']
             
+            # Target statistics for health checks
+            timbre_mean = voice_embedding.timbre_mean
+            timbre_std = voice_embedding.timbre_std
+            style_mean = voice_embedding.style_mean
+            style_std = voice_embedding.style_std
+            
             # Add length smoothness regularization to prevent abrupt changes between lengths
             smoothness_loss = voice_embedding.calculate_smoothness_loss(weight=0.005)
             loss = loss + smoothness_loss
@@ -749,14 +744,18 @@ def train(
                 'batch_stft_loss': stft_loss,
                 'batch_loss': loss.item(),
                 'step': step,
-                'smoothness_loss': smoothness_loss.item()   
+                'smoothness_loss': smoothness_loss.item(),
+                'timbre_mean': timbre_mean,
+                'timbre_std': timbre_std,
+                'style_mean': style_mean,
+                'style_std': style_std   
             }
             
             if style_regularization is not None and style_regularization > 0:
                 batch_metrics['batch_style_reg_loss'] = style_reg_loss
                 
             # Log all metrics at once
-            logger.log_metrics(batch_metrics, step)
+            logger.log_metrics(batch_metrics)
 
             # Update progress bar with memory usage
             progress_bar.set_postfix({
@@ -767,7 +766,6 @@ def train(
 
         avg_loss = epoch_loss / len(loader)
         
-        # Run validation if validation dataset is available
         validation_loss = None
         if validation_loader is not None:
             model.eval()  # Set model to evaluation mode
@@ -850,7 +848,6 @@ def train(
                         voice_embedding.save(f"{out}/{name}/{name}.best.pt")
                 else:
                     print(f"Epoch {epoch:>3}/{epochs}: training loss {avg_loss:.4f} (no validation samples processed)")
-            model.train()  # Set model back to training mode
         else:
             epoch_duration = time.time() - epoch_start_time
             total_duration = time.time() - training_start_time
@@ -859,6 +856,104 @@ def train(
             print(f"\nEpoch {epoch}/{epochs}: loss {avg_loss:.4f} | "
                   f"Time: {format_duration(epoch_duration)} | "
                   f"Remaining: {time_remaining}")
+        model.train()  # Set model back to training mode
+        
+        # Log audio samples and spectrograms every N epochs for monitoring convergence
+        if epoch % log_audio_every == 0:
+            print(f"\n🎵 Logging audio samples for epoch {epoch}...")
+            model.eval()
+            
+            # Use a sample from the dataset for comparison
+            with torch.no_grad():
+                # Get a sample from the training dataset for reference
+                sample_idx = epoch % len(dataset)  # Rotate through different samples
+                sample_text, sample_target_log_mel, sample_target_audio = dataset[sample_idx]
+                
+                # Process the sample text
+                sample_phonemes, _ = g2p.g2p(sample_text)
+                if sample_phonemes and len(sample_phonemes) > 0:
+                    sample_ids = text_to_input_ids(model, sample_phonemes).to(device)
+                    
+                    if sample_ids.shape[1] >= 3:  # Valid sequence
+                        # Generate audio using current voice embedding
+                        sample_phoneme_length = len(sample_phonemes)
+                        sample_voice_input = voice_embedding.get_for_length(sample_phoneme_length).squeeze(1).to(device)
+                        
+                        sample_audio_pred, _ = model.forward_with_tokens.__wrapped__(model, sample_ids, sample_voice_input)
+                        sample_normalized_pred = rms_normalize(sample_audio_pred)
+                        
+                        # Convert to mel spectrograms for comparison
+                        sample_pred_mel = mel_transform(sample_normalized_pred)
+                        sample_pred_log_mel = 20 * torch.log10(sample_pred_mel.clamp(min=1e-5))
+                        
+                        # Move target audio to device and normalize
+                        sample_target_audio_device = sample_target_audio.to(device)
+                        sample_target_normalized = rms_normalize(sample_target_audio_device)
+                        
+                        # Standardize dimensions and truncate for comparison
+                        if sample_target_log_mel.dim() == 4:
+                            sample_target_for_display = sample_target_log_mel.squeeze(0)
+                        else:
+                            sample_target_for_display = sample_target_log_mel.to(device)
+                        
+                        if sample_pred_log_mel.dim() == 2:
+                            sample_pred_log_mel = sample_pred_log_mel.unsqueeze(0)
+                        
+                        # Truncate to same length for fair comparison
+                        sample_pred_display, sample_target_display = dynamic_time_truncation(
+                            sample_pred_log_mel, sample_target_for_display
+                        )
+                        
+                        # Create comparison spectrogram figure
+                        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+                        
+                        # Reference spectrogram (top)
+                        ref_spec = sample_target_display.squeeze(0).cpu().numpy()
+                        im1 = ax1.imshow(ref_spec, aspect='auto', origin='lower', cmap='viridis')
+                        ax1.set_title(f"Reference: {sample_text[:50]}...")
+                        ax1.set_ylabel("Mel Frequency")
+                        plt.colorbar(im1, ax=ax1, shrink=0.6)
+                        
+                        # Generated spectrogram (bottom)
+                        pred_spec = sample_pred_display.squeeze(0).cpu().numpy()
+                        im2 = ax2.imshow(pred_spec, aspect='auto', origin='lower', cmap='viridis')
+                        ax2.set_title(f"Generated (Epoch {epoch})")
+                        ax2.set_ylabel("Mel Frequency")
+                        ax2.set_xlabel("Time Frames")
+                        plt.colorbar(im2, ax=ax2, shrink=0.6)
+                        
+                        plt.tight_layout()
+                        
+                        # Log the comparison spectrogram
+                        logger.log_spectrogram(fig, f"Comparison_Epoch_{epoch}", epoch)
+                        plt.close(fig)
+                        
+                        # Log audio samples (move to CPU and convert to numpy for logging)
+                        # Reference audio
+                        ref_audio_np = sample_target_normalized.squeeze().cpu().numpy()
+                        logger.log_audio(
+                            ref_audio_np, 
+                            24000, 
+                            f"Reference: {sample_text[:30]}", 
+                            epoch, 
+                            is_reference=True
+                        )
+                        
+                        # Generated audio
+                        pred_audio_np = sample_normalized_pred.squeeze().cpu().numpy()
+                        logger.log_audio(
+                            pred_audio_np, 
+                            24000, 
+                            f"Generated: {sample_text[:30]}", 
+                            epoch, 
+                            is_reference=False
+                        )
+                        
+                        print(f"✓ Audio samples logged for epoch {epoch}")
+                        print(f"  Sample text: {sample_text[:60]}...")
+                        print(f"  Phoneme length: {sample_phoneme_length}")
+                
+            model.train()  # Set model back to training mode
         
         # Save the full voice tensor every N epochs
         if epoch % checkpoint_every == 0 or epoch == epochs:
