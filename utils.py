@@ -140,7 +140,7 @@ class TrainingLogger:
             import wandb
             wandb.log(metrics, step=step)
     
-    def log_audio(self, audio, sample_rate, caption, step):
+    def log_audio(self, audio, sample_rate, caption, step, is_reference=False):
         """Log audio sample to both platforms"""
         if self.writer:
             self.writer.add_audio(f'Sample/{caption[:30]}', 
@@ -150,13 +150,16 @@ class TrainingLogger:
         
         if self.use_wandb:
             import wandb
-            wandb.log({
-                f"audio_sample_epoch_{step}": wandb.Audio(
-                    audio, sample_rate=sample_rate, caption=caption[:30]
-                )
-            })
+            if is_reference:
+                wandb.log({f"Reference Audio Epoch {step}": wandb.Audio(audio, sample_rate=sample_rate, caption=caption[:30])})
+            else:
+                wandb.log({
+                    f"Audio Epoch {step}": wandb.Audio(
+                        audio, sample_rate=sample_rate, caption=caption[:30]
+                    )
+                })
     
-    def log_spectrogram(self, spec_img, caption, step):
+    def log_spectrogram(self, spec_img, caption, step, is_reference=False):
         """Log spectrogram figure to both platforms"""
         import matplotlib.pyplot as plt
         
@@ -171,10 +174,10 @@ class TrainingLogger:
             
         if self.use_wandb:
             import wandb
-            if step == 0:
-                wandb.log({"Reference Spectrogram": wandb.Image(fig)})
+            if is_reference:
+                wandb.log({f"Reference Spectrogram Epoch {step}": wandb.Image(fig)})
             else:
-                wandb.log({f"spectrogram_epoch_{step}": wandb.Image(fig)})
+                wandb.log({f"Spectrogram Epoch {step}": wandb.Image(fig)})
             
         plt.close(fig)
     

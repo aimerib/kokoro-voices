@@ -764,7 +764,8 @@ def train(
                         audio=reference_audio.squeeze().cpu().numpy(),
                         sample_rate=24000,
                         caption=f"Reference: {sample_text[:30]}",
-                        step=epoch
+                        step=epoch,
+                        is_reference=True
                     )
                     logger.log_audio(
                         audio=audio_sample,
@@ -777,7 +778,8 @@ def train(
                     logger.log_spectrogram(
                         spec_img=log_reference_mel,
                         caption=f"Reference: {sample_text[:30]}",
-                        step=0
+                        step=epoch,
+                        is_reference=True
                     )
                     logger.log_spectrogram(
                         spec_img=log_mel_sample,
