@@ -153,21 +153,23 @@ class TrainingLogger:
             if is_reference:
                 wandb.log({f"Reference Audio Epoch {step}": wandb.Audio(audio, sample_rate=sample_rate, caption=caption[:30])})
             else:
-                wandb.log({
-                    f"Audio Epoch {step}": wandb.Audio(
-                        audio, sample_rate=sample_rate, caption=caption[:30]
-                    )
-                })
+                wandb.log({f"Audio Epoch {step}": wandb.Audio(audio, sample_rate=sample_rate, caption=caption[:30])})
     
     def log_spectrogram(self, spec_img, caption, step, is_reference=False):
         """Log spectrogram figure to both platforms"""
         import matplotlib.pyplot as plt
         
-        fig, ax = plt.subplots(figsize=(10, 4))
-        im = ax.imshow(spec_img, aspect='auto', origin='lower')
-        plt.colorbar(im, ax=ax)
-        plt.title(caption)
-        plt.tight_layout()
+        # Allow passing in either a numpy image (spectrogram matrix) **or** a pre-made Matplotlib Figure.
+        if isinstance(spec_img, plt.Figure):
+            # Caller provided a ready-made figure – use as-is
+            fig = spec_img
+        else:
+            # spec_img is an ndarray; build a figure around it
+            fig, ax = plt.subplots(figsize=(10, 4))
+            im = ax.imshow(spec_img, aspect='auto', origin='lower')
+            plt.colorbar(im, ax=ax)
+            plt.title(caption)
+            plt.tight_layout()
         
         if self.writer:
             self.writer.add_figure('Spectrogram/Sample', fig, step)

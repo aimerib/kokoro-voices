@@ -722,11 +722,11 @@ def train(
         #     'timbre_hist': wandb.Histogram(voice_embedding.base_voice[0, :128].detach().cpu().numpy()),
         #     'style_hist': wandb.Histogram(voice_embedding.base_voice[0, 128:].detach().cpu().numpy())
         # })
-        logger.log_metrics(log_dict, epoch)
+        logger.log_metrics(log_dict)
         logger.log_metrics({
             'timbre_hist': wandb.Histogram(voice_embedding.base_voice[0, :128].detach().cpu().numpy()),
             'style_hist': wandb.Histogram(voice_embedding.base_voice[0, 128:].detach().cpu().numpy())
-        }, epoch)
+        })
     
         # Log audio samples periodically
         if (epoch % log_audio_every == 0 or epoch == epochs):
