@@ -284,6 +284,7 @@ def train(
     hf_repo_id: Optional[str] = None,              # Repository ID for HuggingFace upload
     checkpoint_every: int = 10,                    # Save checkpoint every N epochs
     patience: int = 15,                            # Early stopping patience
+    enable_early_stopping: bool = True,               # Enable/disable early stopping
     no_reference_voice: bool = False,              # Disable automatic reference voice selection
     manual_voice_id: Optional[str] = None,         # Manually specify a Kokoro voice ID to use as base
     accent: str = 'auto',                          # Accent preference for voice selection
@@ -309,7 +310,10 @@ def train(
     print(f"Output: {out}/{name}")
     print(f"Epochs: {epochs}")
     print(f"Learning rate: {lr}")
-    print(f"Early stopping patience: {patience}")
+    if enable_early_stopping:
+        print(f"Early stopping patience: {patience}")
+    else:
+        print("Early stopping: DISABLED (will run for full epochs)")
     print("="*60 + "\n")
     
     # Initialize accelerator for mixed precision and gradient accumulation
@@ -715,7 +719,8 @@ def train(
     # Initialize on CPU to avoid device conflicts, G2P doesn't need GPU
     g2p = KPipeline(lang_code="a", model=False)  # Only G2P functionality needed
 
-    early_stopping = EarlyStopping(patience=patience, min_delta=0.0001)
+    # Initialize early stopping only if enabled
+    early_stopping = EarlyStopping(patience=patience, min_delta=0.0001) if enable_early_stopping else None
     training_start_time = time.time()
     
     # Memory usage tracking
@@ -1232,7 +1237,7 @@ def train(
         logger.log_embedding_stats(embedding_stats)
         
         # Check for early stopping
-        if validation_loss is not None:
+        if validation_loss is not None and enable_early_stopping and early_stopping is not None:
             if early_stopping(validation_loss):
                 print(f"\nEarly stopping triggered at epoch {epoch}")
                 print(f"Validation loss hasn't improved for {patience} epochs")
@@ -1742,6 +1747,8 @@ if __name__ == "__main__":
                               help="L2 regularization strength for style part of embedding (e.g., 1e-4)")
     training_group.add_argument("--skip-validation", type=bool, default=False,
                               help="Skip validation split")
+    training_group.add_argument("--no-early-stopping", action="store_true",
+                              help="Disable early stopping and run for full number of epochs")
     
     # Add monitoring arguments
     monitoring_group = ap.add_argument_group('Monitoring')
@@ -1806,6 +1813,7 @@ if __name__ == "__main__":
         no_reference_voice=args.no_reference_voice,
         manual_voice_id=args.manual_voice_id,
         accent=args.accent,
+        enable_early_stopping=not args.no_early_stopping,
     )
 
 def select_best_voice(target_voice, voices):
@@ -1850,4 +1858,3 @@ def select_best_base_voice(target_voice_description="", accent='american'):
     selected = available[0]
     print(f"Selected base voice: {selected}")
     return selected
-
