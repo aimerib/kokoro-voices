@@ -284,6 +284,9 @@ def train(
     hf_repo_id: Optional[str] = None,              # Repository ID for HuggingFace upload
     checkpoint_every: int = 10,                    # Save checkpoint every N epochs
     patience: int = 15,                            # Early stopping patience
+    no_reference_voice: bool = False,              # Disable automatic reference voice selection
+    manual_voice_id: Optional[str] = None,         # Manually specify a Kokoro voice ID to use as base
+    accent: str = 'auto',                          # Accent preference for voice selection
 ):
     """Train a Kokoro voice embedding for audiobook narration.
     
@@ -496,18 +499,65 @@ def train(
     # Initialize voice embedding with our utility class
     voice_embedding = VoiceEmbedding(embedding_size=256, max_phoneme_len=MAX_PHONEME_LEN, device=device)
     
-    # Try to initialize from a known good Kokoro voice for better starting point
-    ref_voice = None
-    try:
-        from huggingface_hub import hf_hub_download
+    # Try to initialize from a Kokoro base voice for better convergence
+    base_voice_loaded = False
+    
+    # Option 1: Try to load from Kokoro base voice (recommended)
+    if not no_reference_voice:
         try:
-            # Try to get a reference voice from the official model
+            # Automatic voice selection if no manual voice specified
+            if manual_voice_id is None and accent == 'auto':
+                print("🎯 Automatically selecting best matching Kokoro voice...")
+                try:
+                    from auto_voice_selection import select_voice_automatically
+                    auto_voice_id, auto_accent = select_voice_automatically(data_dir, accent)
+                    if auto_voice_id:
+                        manual_voice_id = auto_voice_id
+                        target_accent = auto_accent
+                        print(f"✓ Auto-selected voice: {auto_voice_id} ({auto_accent})")
+                    else:
+                        target_accent = auto_accent  # Use fallback accent
+                        print(f"Using default {auto_accent} voice")
+                except Exception as e:
+                    print(f"Auto-selection failed: {e}, using default")
+                    target_accent = 'american'  # Final fallback
+            else:
+                # Use manual settings
+                target_accent = accent if accent != 'auto' else 'american'
+            
+            print(f"Attempting to initialize from Kokoro {target_accent} English base voice...")
+            base_voice = load_kokoro_base_voice(manual_voice_id, accent=target_accent, device=device)
+            
+            if base_voice is not None and base_voice.shape[0] == 256:
+                voice_source = f"auto-selected {manual_voice_id}" if manual_voice_id else "default"
+                print(f"Initializing from Kokoro base voice ({voice_source})")
+                with torch.no_grad():
+                    # Use Kokoro voice as base with slight variations for each phoneme length
+                    for i in range(voice_embedding.max_phoneme_len):
+                        # Add slight random variation to avoid exact copy
+                        # This helps with training dynamics while starting close to a good voice
+                        noise = torch.randn_like(base_voice) * 0.03  # Smaller noise for closer init
+                        voice_embedding.voice_embed[i, 0, :] = base_voice + noise
+                        
+                print("✓ Initialized from Kokoro base voice with small variations")
+                base_voice_loaded = True
+                
+        except Exception as e:
+            print(f"Could not load Kokoro base voice: {e}")
+    
+    # Option 2: Fallback to manual HuggingFace download (backup method)
+    if not base_voice_loaded:
+        try:
+            from huggingface_hub import hf_hub_download
+            print("Trying manual voice download from HuggingFace...")
+            
+            # Try to get a reference voice from the official model  
             ref_path = hf_hub_download(repo_id='hexgrad/Kokoro-82M', filename='voices/af_heart.pt')
             ref_voice = torch.load(ref_path, map_location=device)
             
             # If it's a single voice vector, use it as base
             if ref_voice.dim() == 1 and ref_voice.shape[0] == 256:
-                print("Initializing from Kokoro reference voice")
+                print("Initializing from downloaded Kokoro reference voice")
                 with torch.no_grad():
                     # Use reference as base but with some variation
                     for i in range(voice_embedding.max_phoneme_len):
@@ -515,38 +565,42 @@ def train(
                         noise = torch.randn_like(ref_voice) * 0.05
                         voice_embedding.voice_embed[i, 0, :] = ref_voice + noise
                         
-                print("Initialized from reference voice with variations")
+                print("✓ Initialized from downloaded reference voice with variations")
+                base_voice_loaded = True
         except Exception as e:
             print(f"Could not download reference voice: {e}")
-    except Exception as e:
-        print(f"Could not import hf_hub_download: {e}")
+            
+    # Option 3: Try to initialize from local reference if available (final fallback)
+    if not base_voice_loaded:
+        try:
+            # If reference embedding exists, we initialize from it
+            ref_path = f"{out}/{name}/reference.pt"
+            if not os.path.exists(ref_path):
+                ref_path = "reference.pt"
+                
+            if os.path.exists(ref_path):
+                print(f"Initializing from local reference embedding: {ref_path}")
+                ref_data = torch.load(ref_path)
+                ref_voice = ref_data["base_voice"][0]
+                voice_embedding.base_voice.data = ref_data["base_voice"].to(device)
+                voice_embedding.update_full_embedding()
+                
+                # Set target statistics
+                voice_embedding.timbre_mean = ref_voice[:128].mean().item()
+                voice_embedding.timbre_std = ref_voice[:128].std().item()
+                voice_embedding.style_mean = ref_voice[128:].mean().item()
+                voice_embedding.style_std = ref_voice[128:].std().item()
+                
+                print(f"Reference statistics:")
+                print(f"  Timbre: mean={voice_embedding.timbre_mean:.4f}, std={voice_embedding.timbre_std:.4f}")
+                print(f"  Style: mean={voice_embedding.style_mean:.4f}, std={voice_embedding.style_std:.4f}")
+                base_voice_loaded = True
+        except Exception as e:
+            print(f"Could not load local reference: {e}")
     
-    # Try to initialize from local reference if available
-    try:
-        # If reference embedding exists, we initialize from it
-        ref_path = f"{out}/{name}/reference.pt"
-        if not os.path.exists(ref_path):
-            ref_path = "reference.pt"
-            
-        if os.path.exists(ref_path):
-            print(f"Initializing from reference embedding: {ref_path}")
-            ref_data = torch.load(ref_path)
-            ref_voice = ref_data["base_voice"][0]
-            voice_embedding.base_voice.data = ref_data["base_voice"].to(device)
-            voice_embedding.update_full_embedding()
-            
-            # Set target statistics
-            voice_embedding.timbre_mean = ref_voice[:128].mean().item()
-            voice_embedding.timbre_std = ref_voice[:128].std().item()
-            voice_embedding.style_mean = ref_voice[128:].mean().item()
-            voice_embedding.style_std = ref_voice[128:].std().item()
-            
-            print(f"Reference statistics:")
-            print(f"  Timbre: mean={voice_embedding.timbre_mean:.4f}, std={voice_embedding.timbre_std:.4f}")
-            print(f"  Style: mean={voice_embedding.style_mean:.4f}, std={voice_embedding.style_std:.4f}")
-    except Exception as e:
-        print(f"Using default distribution, could not load reference: {e}")
-    
+    if not base_voice_loaded:
+        print("Using default random initialization")
+
     # For backward compatibility - the rest of the code expects these variables
     # but now we use length-dependent embeddings instead of a single base_voice
     voice_embed = voice_embedding.voice_embed
@@ -1399,7 +1453,118 @@ The model was trained using RMS-normalized audio to improve mel-spectrogram loss
     # Write the README.md file
     with open(output_dir / "README.md", "w") as f:
         f.write(readme_content)
+
+
+def get_available_voices():
+    """Get list of available Kokoro voices by language"""
+    voices = {
+        'american': [  # lang_code='a'
+            '0ab5709b', '6d877149', 'c03bd1a4', '8cb64e02', 'cdfdccb8', 
+            '8bfbc512', 'c5561808', 'e0233676', 'e149459b', '49bd364e',
+            'c799548a', 'ced7e284', '8bcfdc85', 'ada66f0e', '98e507ec',
+            'c8255075', '9a443b79', 'e8452be1', 'dd1d8973', '7f2f7582'
+        ],
+        'british': [   # lang_code='b'
+            'd292651b', 'd0a423de', 'cdd4c370', '6e09c2e4', 'fc3fce4e',
+            'd44935f3', 'f1bc8122', 'b5204750'
+        ]
+    }
+    return voices
+
+def load_kokoro_base_voice(voice_file_name, accent='american', device='cpu'):
+    """Load a specific Kokoro voice as base initialization"""
+    try:
+        # If we have a specific voice file name, try to load the voice file
+        if voice_file_name is not None:
+            try:
+                from huggingface_hub import hf_hub_download
+                
+                # Construct the voice file path
+                voice_file_path = f'voices/{voice_file_name}.pt'
+                
+                # Download the .pt voice file
+                downloaded_path = hf_hub_download(
+                    repo_id='hexgrad/Kokoro-82M',
+                    filename=voice_file_path,
+                    cache_dir='./voice_cache'
+                )
+                
+                # Load the voice embedding
+                voice_embedding = torch.load(downloaded_path, map_location=device)
+                print(f"Loaded specific Kokoro voice file: {voice_file_name}")
+                return voice_embedding
+                
+            except Exception as e:
+                print(f"Could not load specific voice file {voice_file_name}: {e}")
+                # Fall back to default voice from model
         
+        # Fallback: Load default voice from Kokoro model
+        from kokoro import KPipeline
+        
+        # Create pipeline with specified language code
+        lang_code = 'a' if accent == 'american' else 'b'
+        pipeline = KPipeline(lang_code=lang_code)
+        
+        # Get the voice embedding from the model
+        # Kokoro voices are stored as voice vectors in the model
+        voice_vector = pipeline.model.style_encoder.embedding.weight.data
+        
+        # Use the first available voice as a reasonable default
+        if voice_vector.shape[0] > 0:
+            base_voice = voice_vector[0].clone()  # Use first voice as base
+            print(f"Loaded default Kokoro voice from {accent} English model")
+            return base_voice.to(device)
+        else:
+            print("No voice vectors found in Kokoro model")
+            return None
+            
+    except Exception as e:
+        print(f"Could not load Kokoro base voice: {e}")
+        return None
+
+def select_best_base_voice(target_voice_description="", accent='american'):
+    """Select the best base voice for initialization based on description"""
+    voices = get_available_voices()
+    available = voices.get(accent, voices['american'])
+    
+    print(f"\nAvailable {accent} English voices:")
+    for i, voice_id in enumerate(available[:10]):  # Show first 10
+        print(f"  {i+1}. {voice_id}")
+    
+    if len(available) > 10:
+        print(f"  ... and {len(available) - 10} more")
+    
+    # For now, return the first voice as default
+    # In the future, this could be enhanced with voice similarity matching
+    selected = available[0]
+    print(f"Selected base voice: {selected}")
+    return selected
+
+def compare_mel_spectrograms(mel1, mel2):
+    """Compare two mel spectrograms and return a similarity score"""
+    # Calculate the mean squared error between the two spectrograms
+    mse = torch.mean((mel1 - mel2) ** 2)
+    return mse.item()
+
+def compare_voices(voice1, voice2):
+    """Compare two voices and return a similarity score"""
+    # Calculate the mean squared error between the two voices
+    mse = torch.mean((voice1 - voice2) ** 2)
+    return mse.item()
+
+def select_best_voice(target_voice, voices):
+    """Select the best voice from a list of voices based on similarity"""
+    best_voice = None
+    best_similarity = float('inf')
+    
+    for voice in voices:
+        similarity = compare_mel_spectrograms(target_voice, voice)
+        if similarity < best_similarity:
+            best_similarity = similarity
+            best_voice = voice
+    
+    return best_voice
+
 
 # ---------------------------------------------------------------------------
 # Entry-point
@@ -1451,6 +1616,15 @@ if __name__ == "__main__":
     monitoring_group.add_argument("--wandb-name", type=str, help="W&B run name")
     monitoring_group.add_argument("--log-audio-every", type=int, default=10, help="Log audio samples every N epochs")
     
+    # Add voice initialization arguments
+    voice_group = ap.add_argument_group('Voice Initialization')
+    voice_group.add_argument("--no-reference-voice", action="store_true", 
+                           help="Disable automatic reference voice selection and use random initialization")
+    voice_group.add_argument("--manual-voice-id", type=str,
+                           help="Manually specify a Kokoro voice ID to use as base (e.g., '0ab5709b')")
+    voice_group.add_argument("--accent", type=str, choices=['american', 'british', 'auto'], default='auto',
+                           help="Accent preference for voice selection. 'auto' will try both and pick best match")
+    
     # Add HuggingFace upload arguments
     hf_group = ap.add_argument_group('HuggingFace Upload')
     hf_group.add_argument("--upload-to-hf", action="store_true", help="Upload model and artifacts to HuggingFace")
@@ -1493,4 +1667,50 @@ if __name__ == "__main__":
         skip_validation=args.skip_validation,
         upload_to_hf=args.upload_to_hf,
         hf_repo_id=args.hf_repo_id,
+        no_reference_voice=args.no_reference_voice,
+        manual_voice_id=args.manual_voice_id,
+        accent=args.accent,
     )
+
+def select_best_voice(target_voice, voices):
+    """Select the best voice from a list of voices based on similarity"""
+    best_voice = None
+    best_similarity = float('inf')
+    
+    for voice in voices:
+        similarity = compare_mel_spectrograms(target_voice, voice)
+        if similarity < best_similarity:
+            best_similarity = similarity
+            best_voice = voice
+    
+    return best_voice
+
+def compare_mel_spectrograms(mel1, mel2):
+    """Compare two mel spectrograms and return a similarity score"""
+    # Calculate the mean squared error between the two spectrograms
+    mse = torch.mean((mel1 - mel2) ** 2)
+    return mse.item()
+
+def compare_voices(voice1, voice2):
+    """Compare two voices and return a similarity score"""
+    # Calculate the mean squared error between the two voices
+    mse = torch.mean((voice1 - voice2) ** 2)
+    return mse.item()
+
+def select_best_base_voice(target_voice_description="", accent='american'):
+    """Select the best base voice for initialization based on description"""
+    voices = get_available_voices()
+    available = voices.get(accent, voices['american'])
+    
+    print(f"\nAvailable {accent} English voices:")
+    for i, voice_id in enumerate(available[:10]):  # Show first 10
+        print(f"  {i+1}. {voice_id}")
+    
+    if len(available) > 10:
+        print(f"  ... and {len(available) - 10} more")
+    
+    # For now, return the first voice as default
+    # In the future, this could be enhanced with voice similarity matching
+    selected = available[0]
+    print(f"Selected base voice: {selected}")
+    return selected
