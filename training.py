@@ -58,7 +58,7 @@ from huggingface_hub import snapshot_download, HfApi, upload_folder
 from torchaudio.functional import spectrogram
 
 # Import refactored utilities
-from utils import VoiceLoss, TrainingLogger, VoiceEmbedding
+from utils import VoiceLoss, TrainingLogger, VoiceEmbedding, calculate_voice_drift
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -313,8 +313,18 @@ def train(
     print("="*60 + "\n")
     
     # Initialize accelerator for mixed precision and gradient accumulation
+    # Auto-detect the best precision based on device capabilities
+    mixed_precision = "no"  # Default to no mixed precision for compatibility
+    if torch.cuda.is_available():
+        # Check if device supports bf16
+        try:
+            torch.cuda.is_bf16_supported()
+            mixed_precision = "bf16"
+        except:
+            mixed_precision = "fp16"
+    
     accelerator = Accelerator(
-        mixed_precision="bf16",
+        mixed_precision=mixed_precision,
         gradient_accumulation_steps=gradient_accumulation_steps,
         device_placement=True,
     )
@@ -501,6 +511,7 @@ def train(
     
     # Try to initialize from a Kokoro base voice for better convergence
     base_voice_loaded = False
+    original_reference_voice = None  # Store for final comparison
     
     # Option 1: Try to load from Kokoro base voice (recommended)
     if not no_reference_voice:
@@ -528,19 +539,52 @@ def train(
             print(f"Attempting to initialize from Kokoro {target_accent} English base voice...")
             base_voice = load_kokoro_base_voice(manual_voice_id, accent=target_accent, device=device)
             
-            if base_voice is not None and base_voice.shape[0] == 256:
+            # Debug: print the actual shape of the loaded voice
+            if base_voice is not None:
+                print(f"Loaded voice shape: {base_voice.shape}")
+            
+            # Check if we have a valid voice vector (handle different possible shapes)
+            valid_voice = False
+            if base_voice is not None:
+                if base_voice.dim() == 1 and base_voice.shape[0] == 256:
+                    # Single voice vector - need to expand to [510, 1, 256]
+                    valid_voice = True
+                elif base_voice.dim() == 2 and base_voice.shape[-1] == 256:
+                    # Extract the voice vector if it's in a batch format
+                    base_voice = base_voice[0] if base_voice.shape[0] == 1 else base_voice.mean(dim=0)
+                    valid_voice = True
+                elif base_voice.dim() == 3 and base_voice.shape == (510, 1, 256):
+                    # Already in the perfect format! [phoneme_len, batch, embed_dim]
+                    print("Voice is already in perfect 3D format [510, 1, 256]")
+                    valid_voice = True
+                elif base_voice.numel() == 256:
+                    # Flatten if needed
+                    base_voice = base_voice.flatten()
+                    valid_voice = True
+            
+            if valid_voice:
                 voice_source = f"auto-selected {manual_voice_id}" if manual_voice_id else "default"
                 print(f"Initializing from Kokoro base voice ({voice_source})")
                 with torch.no_grad():
-                    # Use Kokoro voice as base with slight variations for each phoneme length
-                    for i in range(voice_embedding.max_phoneme_len):
-                        # Add slight random variation to avoid exact copy
-                        # This helps with training dynamics while starting close to a good voice
-                        noise = torch.randn_like(base_voice) * 0.03  # Smaller noise for closer init
-                        voice_embedding.voice_embed[i, 0, :] = base_voice + noise
+                    if base_voice.dim() == 3 and base_voice.shape == (510, 1, 256):
+                        # Voice is already in perfect format - use directly with small variations
+                        print("Using 3D voice directly with small random variations")
+                        for i in range(voice_embedding.max_phoneme_len):
+                            # Add slight random variation to each phoneme position
+                            noise = torch.randn_like(base_voice[i]) * 0.03
+                            voice_embedding.voice_embed[i, 0, :] = base_voice[i, 0, :] + noise.squeeze()
+                    else:
+                        # For 1D voice vectors, use as base with slight variations for each phoneme length
+                        print("Expanding 1D voice to all phoneme positions with variations")
+                        for i in range(voice_embedding.max_phoneme_len):
+                            # Add slight random variation to avoid exact copy
+                            # This helps with training dynamics while starting close to a good voice
+                            noise = torch.randn_like(base_voice) * 0.03
+                            voice_embedding.voice_embed[i, 0, :] = base_voice + noise
                         
                 print("✓ Initialized from Kokoro base voice with small variations")
                 base_voice_loaded = True
+                original_reference_voice = base_voice  # Store for final comparison
                 
         except Exception as e:
             print(f"Could not load Kokoro base voice: {e}")
@@ -567,6 +611,7 @@ def train(
                         
                 print("✓ Initialized from downloaded reference voice with variations")
                 base_voice_loaded = True
+                original_reference_voice = ref_voice  # Store for final comparison
         except Exception as e:
             print(f"Could not download reference voice: {e}")
             
@@ -595,6 +640,7 @@ def train(
                 print(f"  Timbre: mean={voice_embedding.timbre_mean:.4f}, std={voice_embedding.timbre_std:.4f}")
                 print(f"  Style: mean={voice_embedding.style_mean:.4f}, std={voice_embedding.style_std:.4f}")
                 base_voice_loaded = True
+                original_reference_voice = ref_voice  # Store for final comparison
         except Exception as e:
             print(f"Could not load local reference: {e}")
     
@@ -1113,8 +1159,15 @@ def train(
                         )
                         
                         print(f"Logged audio samples for epoch {epoch}")
-                        print(f"  Sample text: {sample_text[:60]}...")
-                        print(f"  Phoneme length: {sample_phoneme_length}")
+                        
+                        # Calculate and log voice drift from original reference
+                        if original_reference_voice is not None:
+                            drift_metrics = calculate_voice_drift(original_reference_voice, voice_embedding, device)
+                            logger.log_voice_drift(drift_metrics, epoch)
+                            print(f"Voice drift - Cosine similarity: {drift_metrics['cosine_similarity']:.4f}")
+                        
+                    else:
+                        print(f"Skipping too short sample phoneme sequence: '{sample_phonemes}'")
         # Save the full voice tensor every N epochs
         if epoch % checkpoint_every == 0 or epoch == epochs:
             # Create output directory if it doesn't exist
@@ -1294,6 +1347,94 @@ def train(
 
     # Close unified logger
     logger.close()
+
+    # Compare original reference voice with trained voice embeddings
+    if original_reference_voice is not None:
+        compare_voice_embeddings(original_reference_voice, voice_embedding, device=device)
+
+
+def compare_voice_embeddings(original_voice, trained_voice_embedding, device='cpu'):
+    """
+    Compare the original reference voice with the final trained voice embedding
+    to see how much the training changed the voice characteristics.
+    
+    Args:
+        original_voice: Original reference voice tensor
+        trained_voice_embedding: VoiceEmbedding object with trained voice
+        device: Device for computation
+    """
+    if original_voice is None:
+        print("No original reference voice available for comparison")
+        return
+    
+    print(f"\n{'='*60}")
+    print("VOICE TRAINING COMPARISON")
+    print(f"{'='*60}")
+    
+    with torch.no_grad():
+        # Move to same device for comparison
+        original_voice = original_voice.to(device)
+        
+        if original_voice.dim() == 3 and original_voice.shape == (510, 1, 256):
+            # 3D format - compare averaged voice
+            original_avg = original_voice.mean(dim=0).squeeze()  # [256]
+            print("Original voice format: 3D [510, 1, 256] - using average")
+        elif original_voice.dim() == 1 and original_voice.shape[0] == 256:
+            # 1D format
+            original_avg = original_voice
+            print("Original voice format: 1D [256]")
+        else:
+            print(f"Unexpected original voice shape: {original_voice.shape}")
+            return
+        
+        # Get current trained voice (average across phoneme positions)
+        trained_avg = trained_voice_embedding.voice_embed.mean(dim=0).squeeze().to(device)  # [256]
+        
+        # Calculate various similarity metrics
+        cosine_sim = F.cosine_similarity(original_avg.unsqueeze(0), trained_avg.unsqueeze(0)).item()
+        l2_distance = torch.norm(original_avg - trained_avg).item()
+        l1_distance = torch.norm(original_avg - trained_avg, p=1).item()
+        max_diff = torch.max(torch.abs(original_avg - trained_avg)).item()
+        
+        # Calculate relative change percentage
+        original_norm = torch.norm(original_avg).item()
+        trained_norm = torch.norm(trained_avg).item()
+        norm_change_percent = ((trained_norm - original_norm) / original_norm) * 100
+        
+        # Analyze per-dimension changes
+        dim_changes = torch.abs(original_avg - trained_avg)
+        top_changed_dims = torch.topk(dim_changes, k=5)
+        
+        print(f"Cosine similarity:     {cosine_sim:.4f} (1.0 = identical, 0.0 = orthogonal)")
+        print(f"L2 distance:           {l2_distance:.4f}")
+        print(f"L1 distance:           {l1_distance:.4f}")
+        print(f"Max dimension change:  {max_diff:.4f}")
+        print(f"Vector norm change:    {norm_change_percent:+.2f}%")
+        
+        print(f"\nTop 5 most changed dimensions:")
+        for i, (change, dim_idx) in enumerate(zip(top_changed_dims.values, top_changed_dims.indices)):
+            print(f"  Dim {dim_idx:3d}: {change:.4f}")
+        
+        # Interpretation
+        print(f"\nInterpretation:")
+        if cosine_sim > 0.95:
+            print("  Very similar - minimal voice change")
+        elif cosine_sim > 0.85:
+            print("  Moderate similarity - voice adapted while keeping character")
+        elif cosine_sim > 0.70:
+            print("  Significant change - voice learned new characteristics")
+        else:
+            print("  Major transformation - voice substantially different")
+        
+        print(f"{'='*60}\n")
+        
+        return {
+            'cosine_similarity': cosine_sim,
+            'l2_distance': l2_distance,
+            'l1_distance': l1_distance,
+            'max_difference': max_diff,
+            'norm_change_percent': norm_change_percent
+        }
 
 
 def save_voice(base_voice, voice_embed, out):
@@ -1478,8 +1619,7 @@ def load_kokoro_base_voice(voice_file_name, accent='american', device='cpu'):
         if voice_file_name is not None:
             try:
                 from huggingface_hub import hf_hub_download
-                
-                # Construct the voice file path
+                # Download the .pt voice file
                 voice_file_path = f'voices/{voice_file_name}.pt'
                 
                 # Download the .pt voice file
@@ -1561,7 +1701,6 @@ def select_best_voice(target_voice, voices):
             best_voice = voice
     
     return best_voice
-
 
 # ---------------------------------------------------------------------------
 # Entry-point
@@ -1711,3 +1850,4 @@ def select_best_base_voice(target_voice_description="", accent='american'):
     selected = available[0]
     print(f"Selected base voice: {selected}")
     return selected
+

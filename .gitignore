@@ -11,3 +11,4 @@ runs/
 .env
 
 .DS_Store
+*cache*

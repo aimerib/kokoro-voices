@@ -237,6 +237,33 @@ class TrainingLogger:
             import wandb
             wandb.log({f"embedding_{k}": v for k, v in stats.items()})
     
+    def log_voice_drift(self, drift_metrics, step=None):
+        """Log voice drift metrics from original reference voice"""
+        if not drift_metrics:
+            return
+            
+        if self.writer:
+            for k, v in drift_metrics.items():
+                if k != 'top_changed_dims':  # Skip the topk tensor
+                    self.writer.add_scalar(f'VoiceDrift/{k}', v, step)
+                
+        if self.use_wandb:
+            import wandb
+            # Log main drift metrics
+            drift_log = {}
+            for k, v in drift_metrics.items():
+                if k != 'top_changed_dims':  # Skip the topk tensor
+                    drift_log[f"voice_drift_{k}"] = v
+            
+            # Log top changed dimensions if available
+            if 'top_changed_dims' in drift_metrics:
+                top_dims = drift_metrics['top_changed_dims']
+                for i, (change, dim_idx) in enumerate(zip(top_dims.values, top_dims.indices)):
+                    drift_log[f"voice_drift_top_change_{i+1}"] = change.item()
+                    drift_log[f"voice_drift_top_dim_{i+1}"] = dim_idx.item()
+            
+            wandb.log(drift_log)
+    
     def close(self):
         """Close logger resources"""
         if self.writer:
@@ -477,3 +504,58 @@ class VoiceEmbedding:
                     embedding.voice_embed[i, 0, :] = base_voice[0]
         
         return embedding
+
+def calculate_voice_drift(original_voice, voice_embedding, device):
+    """
+    Calculate voice drift metrics between the original reference voice and the current voice embedding.
+    
+    Args:
+        original_voice: Original reference voice tensor
+        voice_embedding: VoiceEmbedding object with current voice
+        device: Device for computation
+    
+    Returns:
+        Dictionary with voice drift metrics
+    """
+    if original_voice is None:
+        return {}
+    
+    with torch.no_grad():
+        # Move to same device for comparison
+        original_voice = original_voice.to(device)
+        
+        if original_voice.dim() == 3 and original_voice.shape == (510, 1, 256):
+            # 3D format - compare averaged voice
+            original_avg = original_voice.mean(dim=0).squeeze()  # [256]
+        elif original_voice.dim() == 1 and original_voice.shape[0] == 256:
+            # 1D format
+            original_avg = original_voice
+        else:
+            return {}
+        
+        # Get current trained voice (average across phoneme positions)
+        trained_avg = voice_embedding.voice_embed.mean(dim=0).squeeze().to(device)  # [256]
+        
+        # Calculate various similarity metrics
+        cosine_sim = F.cosine_similarity(original_avg.unsqueeze(0), trained_avg.unsqueeze(0)).item()
+        l2_distance = torch.norm(original_avg - trained_avg).item()
+        l1_distance = torch.norm(original_avg - trained_avg, p=1).item()
+        max_diff = torch.max(torch.abs(original_avg - trained_avg)).item()
+        
+        # Calculate relative change percentage
+        original_norm = torch.norm(original_avg).item()
+        trained_norm = torch.norm(trained_avg).item()
+        norm_change_percent = ((trained_norm - original_norm) / original_norm) * 100
+        
+        # Analyze per-dimension changes
+        dim_changes = torch.abs(original_avg - trained_avg)
+        top_changed_dims = torch.topk(dim_changes, k=5)
+        
+        return {
+            'cosine_similarity': cosine_sim,
+            'l2_distance': l2_distance,
+            'l1_distance': l1_distance,
+            'max_difference': max_diff,
+            'norm_change_percent': norm_change_percent,
+            'top_changed_dims': top_changed_dims
+        }
