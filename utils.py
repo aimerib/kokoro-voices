@@ -696,11 +696,18 @@ def calculate_audio_similarity(voice_embedding, target_audio_path, text, device,
         # generated_audio = torch.empty(0)
         # for _, _, audio in audio_generator:
         #     generated_audio = torch.cat((generated_audio, torch.from_numpy(audio)))
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pt')
-        torch.save(voice_embedding.voice_embed, temp_file.name)
-        generated_audio = generate_with_custom_voice(text, temp_file.name)
-        temp_file.close()
-        os.remove(temp_file.name)
+        temp_file_reference = tempfile.NamedTemporaryFile(delete=False, suffix='.pt')
+        temp_file_generated = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+        
+        torch.save(voice_embedding.voice_embed, temp_file_reference.name)
+        generate_with_custom_voice(text, temp_file_reference.name, temp_file_generated.name)
+        
+        generated_audio, _ = librosa.load(temp_file_generated.name, sr=sr)
+        temp_file_reference.close()
+        temp_file_generated.close()
+        os.remove(temp_file_reference.name)
+        os.remove(temp_file_generated.name)
+        
         # Load target audio
         target_audio, _ = librosa.load(target_audio_path, sr=sr)
         
