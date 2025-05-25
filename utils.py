@@ -66,12 +66,18 @@ class VoiceLoss(nn.Module):
     - Style regularization to prevent embedding explosion
     - Perceptual similarity loss for better voice matching
     """
-    def __init__(self, device="cpu", fft_sizes=[1024, 512, 256], use_perceptual_loss=False):
+    def __init__(self, device="cpu", fft_sizes=[1024, 512, 256], use_perceptual_loss=False,
+                 max_perceptual_weight=0.15, perceptual_start_epoch=5, perceptual_ramp_epochs=10):
         super().__init__()
         self.l1 = nn.L1Loss()
         self.mse = nn.MSELoss()
         self.device = device
         self.use_perceptual_loss = use_perceptual_loss
+        
+        # Perceptual-loss scheduling parameters
+        self.max_perc_weight = max_perceptual_weight
+        self.perc_start_epoch = perceptual_start_epoch
+        self.perc_ramp_epochs = max(perceptual_ramp_epochs, 1)
         
         # STFT windows setup
         self.fft_sizes = fft_sizes
@@ -142,33 +148,33 @@ class VoiceLoss(nn.Module):
         # Perceptual similarity loss
         perceptual_loss = torch.tensor(0.0, device=self.device)
         perceptual_components = {}
-        if self.use_perceptual_loss and epoch > 5:  # Start after initial training
+        if self.use_perceptual_loss and epoch > self.perc_start_epoch:  # Start after initial training
             perceptual_loss, perceptual_components = calculate_training_similarity_loss(
                 pred_mel, target_mel, self.device
             )
             # Scale down perceptual loss to avoid dominating
             perceptual_loss = perceptual_loss * 0.1
         
-        # Combine with appropriate weights
-        # Adjust weights when using perceptual loss
-        if self.use_perceptual_loss and epoch > 5:
-            total_loss = (
-                0.45 * l1_loss + 
-                0.20 * mse_loss + 
-                0.05 * freq_loss + 
-                0.15 * stft_loss + 
-                0.15 * perceptual_loss +  # Add perceptual loss
-                style_reg_loss
-            )
-        else:
-            # Original weights
-            total_loss = (
-                0.55 * l1_loss + 
-                0.25 * mse_loss + 
-                0.05 * freq_loss + 
-                0.15 * stft_loss + 
-                style_reg_loss
-            )
+        # Dynamically adjust perceptual-loss weight
+        perc_weight = 0.0
+        if self.use_perceptual_loss and epoch >= self.perc_start_epoch:
+            # Linear ramp up to max weight
+            prog = (epoch - self.perc_start_epoch + 1) / self.perc_ramp_epochs
+            perc_weight = min(self.max_perc_weight, max(0.0, prog * self.max_perc_weight))
+        # Other static weights
+        freq_weight = 0.05
+        stft_weight = 0.15
+        mse_weight = 0.25
+        # Reduce L1 weight to keep sum ≈ 1
+        l1_weight = 0.55 - perc_weight
+        total_loss = (
+            l1_weight * l1_loss +
+            mse_weight * mse_loss +
+            freq_weight * freq_loss +
+            stft_weight * stft_loss +
+            perc_weight * perceptual_loss +
+            style_reg_loss
+        )
         
         # Prepare loss components dictionary
         loss_components = {
@@ -213,13 +219,17 @@ class TrainingLogger:
     
     def log_metrics(self, metrics, step=None):
         """Log scalar metrics to both TensorBoard and W&B"""
-        if self.writer:
-            for k, v in metrics.items():
-                self.writer.add_scalar(f'Metrics/{k}', v, step)
-                
-        if self.use_wandb:
+        safe_metrics = {}
+        for k, v in metrics.items():
+            # Only accept int/float tensors or scalars
+            if isinstance(v, (int, float)):
+                safe_metrics[k] = float(v)
+                if self.writer:
+                    self.writer.add_scalar(f'Metrics/{k}', v, step)
+        # Log to W&B if enabled
+        if self.use_wandb and safe_metrics:
             import wandb
-            wandb.log(metrics)
+            wandb.log(safe_metrics)
     
     def log_audio(self, audio, sample_rate, caption, step, is_reference=False):
         """Log audio sample to both platforms"""
@@ -687,7 +697,7 @@ def calculate_audio_similarity(voice_embedding, target_audio_path, text, device,
         import os
     except ImportError:
         print("Warning: librosa and scipy required for audio similarity calculation")
-        return {}
+        return {"error": "missing_dependencies"}
     
     try:
         # pipeline = KPipeline(lang_code='a')
@@ -722,7 +732,7 @@ def calculate_audio_similarity(voice_embedding, target_audio_path, text, device,
         
         # Skip if audio too short
         if min_len < sr * 0.5:  # Less than 0.5 seconds
-            return {}
+            return {"error": "audio_too_short", "min_length": int(min_len)}
         
         # Extract mel spectrograms
         n_mels = 80
@@ -822,7 +832,8 @@ def calculate_audio_similarity(voice_embedding, target_audio_path, text, device,
     except Exception as e:
         traceback.print_exc()
         print(f"Error calculating audio similarity: {e}")
-        return {}
+        return {"error": str(e)}
+
 
 def calculate_training_similarity_loss(pred_mel, target_mel, device):
     """
