@@ -710,7 +710,10 @@ def calculate_audio_similarity(voice_embedding, target_audio_path, text, device,
         os.remove(temp_file_generated.name)
         
         # Load target audio
-        target_audio, _ = librosa.load(target_audio_path, sr=sr)
+        if isinstance(target_audio_path, str):
+            target_audio, _ = librosa.load(target_audio_path, sr=sr)
+        else:
+            target_audio = target_audio_path
         
         # Ensure both audios are same length (pad shorter or trim longer)
         min_len = min(len(generated_audio), len(target_audio))
