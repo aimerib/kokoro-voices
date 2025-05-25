@@ -681,19 +681,24 @@ def calculate_audio_similarity(voice_embedding, target_audio_path, text, device,
         from scipy.spatial.distance import cosine
         from scipy.stats import pearsonr
         from kokoro import KPipeline
+        from utils import generate_with_custom_voice
     except ImportError:
         print("Warning: librosa and scipy required for audio similarity calculation")
         return {}
     
     try:
-        pipeline = KPipeline(lang_code='a')
-        # Generate audio with current voice
-        audio_generator = pipeline(text, voice=voice_embedding.voice_embed)
+        # pipeline = KPipeline(lang_code='a')
+        # # Generate audio with current voice
+        # audio_generator = pipeline(text, voice=voice_embedding.voice_embed)
         
-        generated_audio = torch.empty(0)
-        for _, _, audio in audio_generator:
-            generated_audio = torch.cat((generated_audio, torch.from_numpy(audio)))
-
+        # generated_audio = torch.empty(0)
+        # for _, _, audio in audio_generator:
+        #     generated_audio = torch.cat((generated_audio, torch.from_numpy(audio)))
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pt')
+        torch.save(voice_embedding.voice_embed, temp_file.name)
+        generated_audio = generate_with_custom_voice(text, temp_file.name)
+        temp_file.close()
+        os.remove(temp_file.name)
         # Load target audio
         target_audio, _ = librosa.load(target_audio_path, sr=sr)
         
