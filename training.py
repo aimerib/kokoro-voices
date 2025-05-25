@@ -56,6 +56,7 @@ import shutil
 from accelerate import Accelerator
 from huggingface_hub import snapshot_download, HfApi, upload_folder
 from torchaudio.functional import spectrogram
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # Import refactored utilities
 from utils import VoiceLoss, TrainingLogger, VoiceEmbedding, calculate_voice_drift, calculate_audio_similarity
@@ -290,6 +291,9 @@ def train(
     accent: str = 'auto',                          # Accent preference for voice selection
     use_perceptual_loss: bool = False,             # Enable perceptual similarity loss to guide voice convergence
     perceptual_loss_start_epoch: int = 5,          # Epoch to start applying perceptual loss (default: 5)
+    patience_lr: int = 10,                         # Patience for ReduceLROnPlateau scheduler (epochs without improvement)
+    min_lr_scheduler: float = 1e-7,                # Minimum learning rate for ReduceLROnPlateau scheduler
+    lr_scheduler_factor: float = 0.5,              # Factor by which to reduce learning rate (e.g., 0.5 = halve)
 ):
     """Train a Kokoro voice embedding for audiobook narration.
     
@@ -476,7 +480,12 @@ def train(
     )
     
     # Initialize loss calculator
-    loss_calculator = VoiceLoss(device=device, fft_sizes=[1024, 512, 256], use_perceptual_loss=use_perceptual_loss)
+    loss_calculator = VoiceLoss(
+        device=device, 
+        fft_sizes=[1024, 512, 256], 
+        use_perceptual_loss=use_perceptual_loss,
+        perceptual_start_epoch=perceptual_loss_start_epoch
+    )
 
     # Create dataset
     dataset = VoiceDataset(data_root, mel_transform_cpu, split="train")
@@ -683,17 +692,17 @@ def train(
     best_val_loss = float('inf')
     best_epoch = 0
 
-    # Flat-then-cosine schedule: keep LR constant for first 25 % epochs then decay to eta_min.
-    import math
-    warmup_epochs = max(1, int(0.25 * epochs))
-    def lr_lambda(current_epoch: int):
-        if current_epoch < warmup_epochs:
-            return 1.0
-        # progress ∈ [0,1] for the remaining epochs
-        progress = (current_epoch - warmup_epochs) / max(1, (epochs - warmup_epochs))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
+    # Use ReduceLROnPlateau scheduler for adaptive learning rate reduction
+    scheduler = ReduceLROnPlateau(
+        optim, 
+        mode='min', 
+        factor=lr_scheduler_factor,  # Factor by which the learning rate will be reduced
+        patience=patience_lr,        # Number of epochs with no improvement before reducing LR
+        verbose=True, 
+        min_lr=min_lr_scheduler,     # Lower bound on the learning rate
+        threshold=0.0001,            # Threshold for measuring improvement
+        threshold_mode='rel'
+    )
     
     # Prepare scheduler with accelerator
     scheduler = accelerator.prepare(scheduler)
@@ -1231,7 +1240,12 @@ def train(
             logger.log_spectrogram(fig, "Length_Variation", epoch)
             plt.close(fig)
 
-        scheduler.step()
+        # Step the scheduler with validation loss (or training loss if no validation)
+        if validation_loss is not None:
+            scheduler.step(validation_loss)
+        else:
+            # Fallback to training loss if no validation data
+            scheduler.step(avg_loss)
         
         # Check embedding health and apply clamping if needed
         embedding_stats = voice_embedding.check_health(epoch=epoch, warning_threshold=timbre_warning_threshold)
@@ -1755,6 +1769,15 @@ if __name__ == "__main__":
     training_group.add_argument("--perceptual-loss-start-epoch", type=int, default=5,
                               help="Epoch to start applying perceptual loss (default: 5)")
     
+    # Add ReduceLROnPlateau scheduler arguments
+    scheduler_group = ap.add_argument_group('Learning Rate Scheduler')
+    scheduler_group.add_argument("--patience-lr", type=int, default=10,
+                               help="Patience for ReduceLROnPlateau scheduler (epochs without improvement)")
+    scheduler_group.add_argument("--min-lr-scheduler", type=float, default=1e-7,
+                               help="Minimum learning rate for ReduceLROnPlateau scheduler")
+    scheduler_group.add_argument("--lr-scheduler-factor", type=float, default=0.5,
+                               help="Factor by which to reduce learning rate (e.g., 0.5 = halve)")
+    
     # Add monitoring arguments
     monitoring_group = ap.add_argument_group('Monitoring')
     monitoring_group.add_argument("--tensorboard", action="store_true", help="Enable TensorBoard logging")
@@ -1821,6 +1844,9 @@ if __name__ == "__main__":
         enable_early_stopping=not args.no_early_stopping,
         use_perceptual_loss=args.use_perceptual_loss,
         perceptual_loss_start_epoch=args.perceptual_loss_start_epoch,
+        patience_lr=args.patience_lr,
+        min_lr_scheduler=args.min_lr_scheduler,
+        lr_scheduler_factor=args.lr_scheduler_factor,
     )
 
 def select_best_voice(target_voice, voices):
