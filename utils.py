@@ -658,7 +658,7 @@ def generate_with_standard_voice(text, output_file="output.wav"):
     
     return False
 
-def calculate_audio_similarity(voice_embedding, target_audio_path, text, kokoro_pipeline, device, sr=24000):
+def calculate_audio_similarity(voice_embedding, target_audio_path, text, device, sr=24000):
     """
     Calculate audio similarity between generated speech from current voice and target audio.
     
