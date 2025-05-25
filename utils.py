@@ -13,6 +13,9 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import os
 
+import soundfile as sf
+from kokoro import KPipeline
+
 def apply_audio_augmentations(audio: torch.Tensor, sample_rate: int = 24000, training: bool = True) -> torch.Tensor:
     """Apply subtle augmentations to audio for better generalization.
     
@@ -459,8 +462,9 @@ class VoiceEmbedding:
             
     def save(self, path):
         """Save voice embedding to disk"""
+        voice_embedding = self.voice_embed.detach().cpu()
         state_dict = {
-            "voice_embed": self.voice_embed.detach().cpu(),
+            "voice_embed": voice_embedding,
             "embedding_size": self.embedding_size,
             "max_phoneme_len": self.max_phoneme_len,
             "timbre_mean": self.timbre_mean,
@@ -468,12 +472,10 @@ class VoiceEmbedding:
             "style_mean": self.style_mean,
             "style_std": self.style_std
         }
-        torch.save(state_dict, path)
+        torch.save(state_dict, path.replace(".pt", ".embedding.pt"))
         
-        # Also save a simplified base_voice for backwards compatibility
-        base_voice = self.base_voice
-        torch.save({"base_voice": base_voice, "voice_embed": self.voice_embed}, 
-                   path.replace(".pt", ".backward_compat.pt"))
+        # Save the real voice tensor for actual use with Kokoro
+        torch.save(voice_embedding, path)
         
     @classmethod
     def load(cls, path, device="cpu"):
@@ -559,3 +561,66 @@ def calculate_voice_drift(original_voice, voice_embedding, device):
             'norm_change_percent': norm_change_percent,
             'top_changed_dims': top_changed_dims
         }
+
+
+def generate_with_custom_voice(text, voice_path, output_file="output.wav"):
+    # Initialize the pipeline
+    pipeline = KPipeline(lang_code='a')
+    
+    # Load and expand the voice tensor
+    try:
+        voice_tensor = torch.load(voice_path, map_location='cpu')
+# # Register under a name, e.g. 'my_voice'
+# pipeline.voices['my_voice'] = voice_tensor.squeeze(0)  
+#         voice_tensor = torch.load(voice_path)
+        print(f"Loaded voice tensor with shape: {voice_tensor.shape}")
+        
+        # Make sure tensor has the right format for Kokoro
+        # expanded_voice = expand_voice_tensor(voice_tensor)
+        
+        # Generate audio
+        outputs = []
+        for _, _, audio in pipeline(text, voice=voice_tensor):
+            print(f"Generated {audio.shape[0]} samples")
+            outputs.append(audio)
+        
+        # Combine and save
+        if outputs:
+            full_audio = torch.cat(outputs)
+            sf.write(output_file, full_audio.numpy(), 24000)
+            print(f"Saved audio to {output_file}")
+            return True
+    except Exception as e:
+        print(f"Error: {e}")
+        print("Falling back to stock voice")
+        
+        # Fallback to a stock voice
+        outputs = []
+        for _, _, audio in pipeline(text, voice="af_heart"):
+            outputs.append(audio)
+        
+        if outputs:
+            full_audio = torch.cat(outputs)
+            sf.write(output_file, full_audio.numpy(), 24000)
+            print(f"Saved audio with fallback voice to {output_file}")
+            return True
+    
+    return False
+
+def generate_with_standard_voice(text, output_file="output.wav"):
+    # Initialize the pipeline
+    pipeline = KPipeline(lang_code='a')
+    
+    # Generate audio
+    outputs = []
+    for _, _, audio in pipeline(text, voice="af_heart"):
+        outputs.append(audio)
+    
+    # Combine and save
+    if outputs:
+        full_audio = torch.cat(outputs)
+        sf.write(output_file, full_audio.numpy(), 24000)
+        print(f"Saved audio to {output_file}")
+        return True
+    
+    return False

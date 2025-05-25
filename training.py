@@ -699,7 +699,7 @@ def train(
         checkpoints = sorted([f for f in checkpoint_dir.iterdir() if f.suffix == '.pt' and 'epoch' in f.name])
         if checkpoints:
             latest_checkpoint = checkpoints[-1]
-            resume_epoch = int(latest_checkpoint.stem.split('_')[-1])
+            resume_epoch = int(latest_checkpoint.stem.split('epoch')[1].split('.')[0])
             print(f"Found checkpoint at epoch {resume_epoch}, resuming training...")
             checkpoint_data = torch.load(latest_checkpoint, map_location=device)
             voice_embedding.voice_embed.data = checkpoint_data['voice_embed'].to(device)
