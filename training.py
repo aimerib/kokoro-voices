@@ -698,7 +698,6 @@ def train(
         mode='min', 
         factor=lr_scheduler_factor,  # Factor by which the learning rate will be reduced
         patience=patience_lr,        # Number of epochs with no improvement before reducing LR
-        verbose=True, 
         min_lr=min_lr_scheduler,     # Lower bound on the learning rate
         threshold=0.0001,            # Threshold for measuring improvement
         threshold_mode='rel'
