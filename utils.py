@@ -687,9 +687,8 @@ def calculate_audio_similarity(voice_embedding, target_audio_path, text, device,
     
     try:
         pipeline = KPipeline(lang_code='a')
-        voice = torch.load(voice_embedding.voice_embed, map_location='cpu')
         # Generate audio with current voice
-        audio_generator = pipeline(text, voice=voice)
+        audio_generator = pipeline(text, voice=voice_embedding.voice_embed)
         
         generated_audio = torch.empty(0)
         for _, _, audio in audio_generator:
