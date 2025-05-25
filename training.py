@@ -58,7 +58,7 @@ from huggingface_hub import snapshot_download, HfApi, upload_folder
 from torchaudio.functional import spectrogram
 
 # Import refactored utilities
-from utils import VoiceLoss, TrainingLogger, VoiceEmbedding, calculate_voice_drift
+from utils import VoiceLoss, TrainingLogger, VoiceEmbedding, calculate_voice_drift, calculate_audio_similarity
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -1162,7 +1162,9 @@ def train(
                             epoch, 
                             is_reference=False
                         )
-                        
+
+                        similarity_metrics = calculate_audio_similarity(voice_embedding, sample_target_audio, sample_text, device)
+                        logger.log_metrics(similarity_metrics)
                         print(f"Logged audio samples for epoch {epoch}")
                         
                         # Calculate and log voice drift from original reference
@@ -1642,14 +1644,7 @@ def load_kokoro_base_voice(voice_file_name, accent='american', device='cpu'):
             except Exception as e:
                 print(f"Could not load specific voice file {voice_file_name}: {e}")
                 # Fall back to default voice from model
-        
-        # Fallback: Load default voice from Kokoro model
-        from kokoro import KPipeline
-        
-        # Create pipeline with specified language code
-        lang_code = 'a' if accent == 'american' else 'b'
-        pipeline = KPipeline(lang_code=lang_code)
-        
+
         # The KModel doesn't have a style_encoder attribute directly accessible
         # Instead, we'll use a small random voice vector as fallback
         print(f"Cannot access voice embeddings from KModel, using fallback approach")

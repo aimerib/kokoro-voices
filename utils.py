@@ -624,3 +624,201 @@ def generate_with_standard_voice(text, output_file="output.wav"):
         return True
     
     return False
+
+def calculate_audio_similarity(voice_embedding, target_audio_path, text, kokoro_pipeline, device, sr=24000):
+    """
+    Calculate audio similarity between generated speech from current voice and target audio.
+    
+    This provides perceptual similarity metrics by generating speech with the current voice
+    and comparing it to target audio samples using mel spectrograms and audio features.
+    
+    Args:
+        voice_embedding: VoiceEmbedding object with current trained voice
+        target_audio_path: Path to target wav file
+        text: Text that was used to generate the target audio
+        kokoro_pipeline: Kokoro pipeline for speech generation
+        device: Device for computation
+        sr: Sample rate (default 24000 for Kokoro)
+    
+    Returns:
+        Dictionary with audio similarity metrics
+    """
+    try:
+        import librosa
+        import numpy as np
+        from scipy.spatial.distance import cosine
+        from scipy.stats import pearsonr
+        from kokoro import KPipeline
+    except ImportError:
+        print("Warning: librosa and scipy required for audio similarity calculation")
+        return {}
+    
+    try:
+        pipeline = KPipeline(lang_code='a')
+        # Generate audio with current voice
+        audio_generator = pipeline(text, voice=voice_embedding.voice_embed.squeeze().cpu().numpy())
+        
+        generated_audio = torch.empty(0)
+        for _, _, audio in audio_generator:
+            generated_audio = torch.cat((generated_audio, torch.from_numpy(audio)))
+
+        # Load target audio
+        target_audio, _ = librosa.load(target_audio_path, sr=sr)
+        
+        # Ensure both audios are same length (pad shorter or trim longer)
+        min_len = min(len(generated_audio), len(target_audio))
+        generated_audio = generated_audio[:min_len]
+        target_audio = target_audio[:min_len]
+        
+        # Skip if audio too short
+        if min_len < sr * 0.5:  # Less than 0.5 seconds
+            return {}
+        
+        # Extract mel spectrograms
+        n_mels = 80
+        hop_length = 256
+        win_length = 1024
+        n_fft = 1024
+        
+        generated_mel = librosa.feature.melspectrogram(
+            y=generated_audio, sr=sr, n_mels=n_mels, 
+            hop_length=hop_length, win_length=win_length, n_fft=n_fft
+        )
+        target_mel = librosa.feature.melspectrogram(
+            y=target_audio, sr=sr, n_mels=n_mels,
+            hop_length=hop_length, win_length=win_length, n_fft=n_fft
+        )
+        
+        # Convert to log scale
+        generated_mel_db = librosa.power_to_db(generated_mel)
+        target_mel_db = librosa.power_to_db(target_mel)
+        
+        # Align spectrograms (pad shorter one)
+        min_frames = min(generated_mel_db.shape[1], target_mel_db.shape[1])
+        generated_mel_db = generated_mel_db[:, :min_frames]
+        target_mel_db = target_mel_db[:, :min_frames]
+        
+        # Calculate similarity metrics
+        metrics = {}
+        
+        # 1. Mel Cepstral Distortion (MCD) - lower is better
+        generated_mfcc = librosa.feature.mfcc(S=generated_mel_db, n_mfcc=13)
+        target_mfcc = librosa.feature.mfcc(S=target_mel_db, n_mfcc=13)
+        mcd = np.mean(np.sqrt(np.sum((generated_mfcc - target_mfcc) ** 2, axis=0)))
+        metrics['mel_cepstral_distortion'] = mcd
+        
+        # 2. Spectral convergence - lower is better
+        spectral_conv = np.linalg.norm(generated_mel_db - target_mel_db, 'fro') / np.linalg.norm(target_mel_db, 'fro')
+        metrics['spectral_convergence'] = spectral_conv
+        
+        # 3. Cosine similarity on flattened mel spectrograms - higher is better
+        generated_flat = generated_mel_db.flatten()
+        target_flat = target_mel_db.flatten()
+        mel_cosine_sim = 1 - cosine(generated_flat, target_flat)
+        metrics['mel_cosine_similarity'] = mel_cosine_sim
+        
+        # 4. Pearson correlation on mel spectrograms - higher is better
+        mel_correlation, _ = pearsonr(generated_flat, target_flat)
+        metrics['mel_correlation'] = mel_correlation
+        
+        # 5. Fundamental frequency similarity (F0)
+        try:
+            generated_f0, _ = librosa.piptrack(y=generated_audio, sr=sr)
+            target_f0, _ = librosa.piptrack(y=target_audio, sr=sr)
+            
+            # Get dominant F0
+            generated_f0_dom = np.max(generated_f0, axis=0)
+            target_f0_dom = np.max(target_f0, axis=0)
+            
+            # Remove zero values
+            generated_f0_nonzero = generated_f0_dom[generated_f0_dom > 0]
+            target_f0_nonzero = target_f0_dom[target_f0_dom > 0]
+            
+            if len(generated_f0_nonzero) > 0 and len(target_f0_nonzero) > 0:
+                f0_diff = abs(np.mean(generated_f0_nonzero) - np.mean(target_f0_nonzero))
+                metrics['f0_difference_hz'] = f0_diff
+                
+                # F0 similarity (normalized by target F0)
+                f0_similarity = 1 - (f0_diff / np.mean(target_f0_nonzero))
+                metrics['f0_similarity'] = max(0, f0_similarity)  # Clamp to 0-1
+        except:
+            metrics['f0_difference_hz'] = float('inf')
+            metrics['f0_similarity'] = 0.0
+        
+        # 6. Spectral centroid similarity
+        generated_centroid = librosa.feature.spectral_centroid(y=generated_audio, sr=sr)[0]
+        target_centroid = librosa.feature.spectral_centroid(y=target_audio, sr=sr)[0]
+        
+        min_centroid_len = min(len(generated_centroid), len(target_centroid))
+        generated_centroid = generated_centroid[:min_centroid_len]
+        target_centroid = target_centroid[:min_centroid_len]
+        
+        centroid_correlation, _ = pearsonr(generated_centroid, target_centroid)
+        metrics['spectral_centroid_correlation'] = centroid_correlation
+        
+        # 7. Overall perceptual similarity score (weighted combination)
+        # Higher is better, range 0-1
+        perceptual_score = (
+            mel_cosine_sim * 0.3 +
+            mel_correlation * 0.3 +
+            (1 - min(spectral_conv, 1.0)) * 0.2 +  # Invert spectral convergence
+            metrics['f0_similarity'] * 0.1 +
+            (centroid_correlation if not np.isnan(centroid_correlation) else 0) * 0.1
+        )
+        metrics['perceptual_similarity_score'] = max(0, min(1, perceptual_score))
+        
+        return metrics
+        
+    except Exception as e:
+        print(f"Error calculating audio similarity: {e}")
+        return {}
+
+def interpret_audio_similarity(metrics):
+    """
+    Provide human-readable interpretation of audio similarity metrics.
+    
+    Args:
+        metrics: Dictionary from calculate_audio_similarity
+    
+    Returns:
+        String with interpretation
+    """
+    if not metrics:
+        return "No audio similarity metrics available"
+    
+    interpretation = []
+    
+    # Perceptual similarity score
+    perceptual = metrics.get('perceptual_similarity_score', 0)
+    if perceptual > 0.85:
+        interpretation.append(" Excellent perceptual similarity - voices sound very similar")
+    elif perceptual > 0.70:
+        interpretation.append(" Good perceptual similarity - voices are recognizably similar")
+    elif perceptual > 0.50:
+        interpretation.append(" Moderate similarity - some voice characteristics match")
+    else:
+        interpretation.append(" Low similarity - significant voice differences")
+    
+    # Mel Cepstral Distortion
+    mcd = metrics.get('mel_cepstral_distortion', float('inf'))
+    if mcd < 2.0:
+        interpretation.append(" Very low MCD - excellent spectral match")
+    elif mcd < 4.0:
+        interpretation.append(" Good MCD - solid spectral similarity")
+    elif mcd < 6.0:
+        interpretation.append(" Moderate MCD - some spectral differences")
+    else:
+        interpretation.append(" High MCD - significant spectral differences")
+    
+    # F0 similarity
+    f0_sim = metrics.get('f0_similarity', 0)
+    if f0_sim > 0.90:
+        interpretation.append(" Excellent pitch matching")
+    elif f0_sim > 0.70:
+        interpretation.append(" Good pitch similarity")
+    elif f0_sim > 0.50:
+        interpretation.append(" Moderate pitch differences")
+    else:
+        interpretation.append(" Significant pitch differences")
+    
+    return " | ".join(interpretation)
