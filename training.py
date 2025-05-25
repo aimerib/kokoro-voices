@@ -288,6 +288,8 @@ def train(
     no_reference_voice: bool = False,              # Disable automatic reference voice selection
     manual_voice_id: Optional[str] = None,         # Manually specify a Kokoro voice ID to use as base
     accent: str = 'auto',                          # Accent preference for voice selection
+    use_perceptual_loss: bool = False,             # Enable perceptual similarity loss to guide voice convergence
+    perceptual_loss_start_epoch: int = 5,          # Epoch to start applying perceptual loss (default: 5)
 ):
     """Train a Kokoro voice embedding for audiobook narration.
     
@@ -314,6 +316,10 @@ def train(
         print(f"Early stopping patience: {patience}")
     else:
         print("Early stopping: DISABLED (will run for full epochs)")
+    if use_perceptual_loss:
+        print(f"Perceptual loss: ENABLED (starting at epoch {perceptual_loss_start_epoch})")
+    else:
+        print("Perceptual loss: DISABLED")
     print("="*60 + "\n")
     
     # Initialize accelerator for mixed precision and gradient accumulation
@@ -470,7 +476,7 @@ def train(
     )
     
     # Initialize loss calculator
-    loss_calculator = VoiceLoss(device=device, fft_sizes=[1024, 512, 256])
+    loss_calculator = VoiceLoss(device=device, fft_sizes=[1024, 512, 256], use_perceptual_loss=use_perceptual_loss)
 
     # Create dataset
     dataset = VoiceDataset(data_root, mel_transform_cpu, split="train")
@@ -1744,6 +1750,10 @@ if __name__ == "__main__":
                               help="Skip validation split")
     training_group.add_argument("--no-early-stopping", action="store_true",
                               help="Disable early stopping and run for full number of epochs")
+    training_group.add_argument("--use-perceptual-loss", action="store_true",
+                              help="Enable perceptual similarity loss to guide voice convergence")
+    training_group.add_argument("--perceptual-loss-start-epoch", type=int, default=5,
+                              help="Epoch to start applying perceptual loss (default: 5)")
     
     # Add monitoring arguments
     monitoring_group = ap.add_argument_group('Monitoring')
@@ -1809,6 +1819,8 @@ if __name__ == "__main__":
         manual_voice_id=args.manual_voice_id,
         accent=args.accent,
         enable_early_stopping=not args.no_early_stopping,
+        use_perceptual_loss=args.use_perceptual_loss,
+        perceptual_loss_start_epoch=args.perceptual_loss_start_epoch,
     )
 
 def select_best_voice(target_voice, voices):

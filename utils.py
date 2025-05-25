@@ -63,12 +63,14 @@ class VoiceLoss(nn.Module):
     - Frequency gradient loss for detail preservation
     - Multi-resolution STFT loss on raw audio
     - Style regularization to prevent embedding explosion
+    - Perceptual similarity loss for better voice matching
     """
-    def __init__(self, device="cpu", fft_sizes=[1024, 512, 256]):
+    def __init__(self, device="cpu", fft_sizes=[1024, 512, 256], use_perceptual_loss=False):
         super().__init__()
         self.l1 = nn.L1Loss()
         self.mse = nn.MSELoss()
         self.device = device
+        self.use_perceptual_loss = use_perceptual_loss
         
         # STFT windows setup
         self.fft_sizes = fft_sizes
@@ -136,24 +138,55 @@ class VoiceLoss(nn.Module):
             mr_tgt = self.mrstft(wave_tgt)
             stft_loss = sum(self.l1(p, t) for p, t in zip(mr_pred, mr_tgt)) / len(self.fft_sizes)
         
-        # Combine with appropriate weights
-        total_loss = (
-            0.55 * l1_loss + 
-            0.25 * mse_loss + 
-            0.05 * freq_loss + 
-            0.15 * stft_loss + 
-            style_reg_loss
-        )
+        # Perceptual similarity loss
+        perceptual_loss = torch.tensor(0.0, device=self.device)
+        perceptual_components = {}
+        if self.use_perceptual_loss and epoch > 5:  # Start after initial training
+            perceptual_loss, perceptual_components = calculate_training_similarity_loss(
+                pred_mel, target_mel, self.device
+            )
+            # Scale down perceptual loss to avoid dominating
+            perceptual_loss = perceptual_loss * 0.1
         
-        # Return both the total loss and individual components
-        return total_loss, {
+        # Combine with appropriate weights
+        # Adjust weights when using perceptual loss
+        if self.use_perceptual_loss and epoch > 5:
+            total_loss = (
+                0.45 * l1_loss + 
+                0.20 * mse_loss + 
+                0.05 * freq_loss + 
+                0.15 * stft_loss + 
+                0.15 * perceptual_loss +  # Add perceptual loss
+                style_reg_loss
+            )
+        else:
+            # Original weights
+            total_loss = (
+                0.55 * l1_loss + 
+                0.25 * mse_loss + 
+                0.05 * freq_loss + 
+                0.15 * stft_loss + 
+                style_reg_loss
+            )
+        
+        # Prepare loss components dictionary
+        loss_components = {
             "l1_loss": l1_loss.item(),
             "mse_loss": mse_loss.item(),
             "freq_loss": freq_loss.item(),
             "stft_loss": stft_loss.item(),
             "style_reg_loss": style_reg_loss.item(),
+            "perceptual_loss": perceptual_loss.item() if isinstance(perceptual_loss, torch.Tensor) else 0.0,
             "total_loss": total_loss.item()
         }
+        
+        # Add perceptual sub-components if available
+        if perceptual_components:
+            for key, value in perceptual_components.items():
+                loss_components[f"perceptual_{key}"] = value.item() if isinstance(value, torch.Tensor) else value
+        
+        # Return both the total loss and individual components
+        return total_loss, loss_components
 
 
 class TrainingLogger:
@@ -772,6 +805,96 @@ def calculate_audio_similarity(voice_embedding, target_audio_path, text, kokoro_
     except Exception as e:
         print(f"Error calculating audio similarity: {e}")
         return {}
+
+def calculate_training_similarity_loss(pred_mel, target_mel, device):
+    """
+    Calculate differentiable similarity losses between predicted and target mel spectrograms.
+    This is a simplified version of calculate_audio_similarity designed for use during training.
+    
+    Args:
+        pred_mel: Predicted mel spectrogram [B, n_mels, T]
+        target_mel: Target mel spectrogram [B, n_mels, T]
+        device: Device for computation
+        
+    Returns:
+        Dictionary with differentiable loss components
+    """
+    import torch.nn.functional as F
+    
+    # Ensure same shape
+    min_t = min(pred_mel.shape[-1], target_mel.shape[-1])
+    pred_mel = pred_mel[..., :min_t]
+    target_mel = target_mel[..., :min_t]
+    
+    losses = {}
+    
+    # 1. Cosine similarity loss (maximize similarity = minimize negative cosine)
+    # Flatten spectrograms for cosine similarity
+    pred_flat = pred_mel.view(pred_mel.shape[0], -1)
+    target_flat = target_mel.view(target_mel.shape[0], -1)
+    
+    # Normalize for cosine similarity
+    pred_norm = F.normalize(pred_flat, p=2, dim=1)
+    target_norm = F.normalize(target_flat, p=2, dim=1)
+    
+    # Cosine similarity (batch-wise)
+    cosine_sim = (pred_norm * target_norm).sum(dim=1)
+    cosine_loss = 1.0 - cosine_sim.mean()  # Convert to loss (0 = identical)
+    losses['cosine_loss'] = cosine_loss
+    
+    # 2. Spectral convergence loss (normalized L2)
+    spectral_conv = torch.norm(pred_mel - target_mel, p='fro') / (torch.norm(target_mel, p='fro') + 1e-8)
+    losses['spectral_convergence'] = spectral_conv
+    
+    # 3. Log-magnitude L1 loss (perceptually weighted)
+    # Apply log scaling for perceptual weighting
+    pred_log = torch.log(torch.clamp(pred_mel, min=1e-5))
+    target_log = torch.log(torch.clamp(target_mel, min=1e-5))
+    log_l1_loss = F.l1_loss(pred_log, target_log)
+    losses['log_l1_loss'] = log_l1_loss
+    
+    # 4. Frequency-wise correlation loss
+    # Calculate correlation along time axis for each frequency bin
+    # This helps match the spectral envelope
+    freq_corr_loss = 0
+    for i in range(pred_mel.shape[1]):  # For each frequency bin
+        pred_freq = pred_mel[:, i, :]
+        target_freq = target_mel[:, i, :]
+        
+        # Normalize each frequency bin
+        pred_freq_norm = (pred_freq - pred_freq.mean(dim=1, keepdim=True)) / (pred_freq.std(dim=1, keepdim=True) + 1e-8)
+        target_freq_norm = (target_freq - target_freq.mean(dim=1, keepdim=True)) / (target_freq.std(dim=1, keepdim=True) + 1e-8)
+        
+        # Correlation as dot product of normalized vectors
+        corr = (pred_freq_norm * target_freq_norm).mean(dim=1)
+        freq_corr_loss += (1.0 - corr.mean())
+    
+    freq_corr_loss = freq_corr_loss / pred_mel.shape[1]
+    losses['freq_correlation_loss'] = freq_corr_loss
+    
+    # 5. Spectral centroid matching loss
+    # Compute spectral centroid (center of mass of spectrum)
+    freq_bins = torch.arange(pred_mel.shape[1], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(-1)
+    
+    pred_centroid = (freq_bins * pred_mel).sum(dim=1) / (pred_mel.sum(dim=1) + 1e-8)
+    target_centroid = (freq_bins * target_mel).sum(dim=1) / (target_mel.sum(dim=1) + 1e-8)
+    
+    centroid_loss = F.l1_loss(pred_centroid, target_centroid)
+    losses['centroid_loss'] = centroid_loss
+    
+    # Combined perceptual loss
+    perceptual_loss = (
+        0.3 * cosine_loss +
+        0.2 * spectral_conv +
+        0.2 * log_l1_loss +
+        0.2 * freq_corr_loss +
+        0.1 * centroid_loss
+    )
+    
+    losses['perceptual_loss'] = perceptual_loss
+    
+    return perceptual_loss, losses
+
 
 def interpret_audio_similarity(metrics):
     """
