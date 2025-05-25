@@ -669,7 +669,6 @@ def calculate_audio_similarity(voice_embedding, target_audio_path, text, device,
         voice_embedding: VoiceEmbedding object with current trained voice
         target_audio_path: Path to target wav file
         text: Text that was used to generate the target audio
-        kokoro_pipeline: Kokoro pipeline for speech generation
         device: Device for computation
         sr: Sample rate (default 24000 for Kokoro)
     
@@ -688,8 +687,9 @@ def calculate_audio_similarity(voice_embedding, target_audio_path, text, device,
     
     try:
         pipeline = KPipeline(lang_code='a')
+        voice = torch.load(voice_embedding.voice_embed, map_location='cpu')
         # Generate audio with current voice
-        audio_generator = pipeline(text, voice=voice_embedding.voice_embed.squeeze().cpu().numpy())
+        audio_generator = pipeline(text, voice=voice)
         
         generated_audio = torch.empty(0)
         for _, _, audio in audio_generator:
@@ -830,8 +830,8 @@ def calculate_training_similarity_loss(pred_mel, target_mel, device):
     
     # 1. Cosine similarity loss (maximize similarity = minimize negative cosine)
     # Flatten spectrograms for cosine similarity
-    pred_flat = pred_mel.view(pred_mel.shape[0], -1)
-    target_flat = target_mel.view(target_mel.shape[0], -1)
+    pred_flat = pred_mel.reshape(pred_mel.shape[0], -1)
+    target_flat = target_mel.reshape(target_mel.shape[0], -1)
     
     # Normalize for cosine similarity
     pred_norm = F.normalize(pred_flat, p=2, dim=1)
