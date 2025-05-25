@@ -12,6 +12,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import os
+import traceback
 
 import soundfile as sf
 from kokoro import KPipeline
@@ -816,6 +817,7 @@ def calculate_audio_similarity(voice_embedding, target_audio_path, text, device,
         return metrics
         
     except Exception as e:
+        traceback.print_exc()
         print(f"Error calculating audio similarity: {e}")
         return {}
 
