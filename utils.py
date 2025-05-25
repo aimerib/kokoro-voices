@@ -682,6 +682,8 @@ def calculate_audio_similarity(voice_embedding, target_audio_path, text, device,
         from scipy.stats import pearsonr
         from kokoro import KPipeline
         from utils import generate_with_custom_voice
+        import tempfile
+        import os
     except ImportError:
         print("Warning: librosa and scipy required for audio similarity calculation")
         return {}
