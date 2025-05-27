@@ -165,38 +165,38 @@ class AudioEnhancer:
         device = get_device_info()
         device = "cpu" if device == "mps" else device
 
-        # dwav = audio.mean(0)
-        # hwav, _ = enhance(dwav, sr, device="cpu", nfe=64)
+        dwav = audio.mean(0)
+        hwav, _ = enhance(dwav, sr, device="cpu", nfe=64)
 
         # if sr != 44100:
         #     audio = torchaudio.transforms.Resample(sr, 44100)(audio)
         #     sr = 44100
 
-        processed = torch.zeros_like(audio)
-        chunk_sec = self.config.get("voicefixer_chunk_duration", 10)
-        overlap_sec = 1.0
-        total_chunks = 0
+        # processed = torch.zeros_like(audio)
+        # chunk_sec = self.config.get("voicefixer_chunk_duration", 10)
+        # overlap_sec = 1.0
+        # total_chunks = 0
 
-        for i, chunk in enumerate(
-            chunk_generator(audio, sr, chunk_sec=chunk_sec, overlap_sec=overlap_sec)
-        ):
-            self.logger.info("Processing VoiceFixer chunk %d", i + 1)
-            # Convert to integers for slicing
-            start = int(i * (chunk_sec - overlap_sec) * sr)
-            end = int(start + chunk.shape[-1])
+        # for i, chunk in enumerate(
+        #     chunk_generator(audio, sr, chunk_sec=chunk_sec, overlap_sec=overlap_sec)
+        # ):
+        #     self.logger.info("Processing VoiceFixer chunk %d", i + 1)
+        #     # Convert to integers for slicing
+        #     start = int(i * (chunk_sec - overlap_sec) * sr)
+        #     end = int(start + chunk.shape[-1])
 
-            dwav = chunk.mean(0)
-            hwav, _ = enhance(dwav, sr, device=device, nfe=64)
+        #     dwav = chunk.mean(0)
+        #     hwav, _ = enhance(dwav, sr, device=device, nfe=64)
 
-            processed[..., start:end] = hwav[None]
-            total_chunks += 1
+        #     processed[..., start:end] = hwav[None]
+        #     total_chunks += 1
 
-        self.logger.info(
-            "Completed VoiceFixer processing in %.2fs (%d chunks)",
-            time.time() - start_time,
-            total_chunks,
-        )
-        return processed
+        # self.logger.info(
+        #     "Completed VoiceFixer processing in %.2fs (%d chunks)",
+        #     time.time() - start_time,
+        #     total_chunks,
+        # )
+        # return processed
 
 
         #     with NamedTemporaryFile(suffix=".wav", delete=False) as f_in, \
