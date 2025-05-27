@@ -32,3 +32,4 @@ inflect
 yt-dlp
 
 git+https://github.com/resemble-ai/resemble-enhance.git
+speechbrain
