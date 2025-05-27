@@ -160,6 +160,10 @@ class AudioEnhancer:
         )
 
         from resemble_enhance.enhancer.inference import enhance
+        from utilities import get_device_info
+
+        device = get_device_info()
+        device = "cpu" if device == "mps" else device
 
         # dwav = audio.mean(0)
         # hwav, _ = enhance(dwav, sr, device="cpu", nfe=64)
@@ -182,7 +186,7 @@ class AudioEnhancer:
             end = int(start + chunk.shape[-1])
 
             dwav = chunk.mean(0)
-            hwav, _ = enhance(dwav, sr, device="cpu", nfe=64)
+            hwav, _ = enhance(dwav, sr, device=device, nfe=64)
 
             processed[..., start:end] = hwav[None]
             total_chunks += 1
