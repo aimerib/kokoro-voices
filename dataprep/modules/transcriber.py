@@ -46,7 +46,6 @@ class AudioTranscriber:
         self.model = whisper.load_model(self.model_name)
         self.transcribe_fn = lambda audio: self.model.transcribe(
             audio,
-            word_timestamps=False,
             verbose=False,
             language="en",
         )
@@ -60,9 +59,10 @@ class AudioTranscriber:
                 without_timestamps=True,
                 verbose=False,
                 language="en",
-        )
+            )
         except ImportError:
-            self.logger.warning("whisper_mps not found, falling back to standard Whisper")
+            self.logger.warning(
+                "whisper_mps not found, falling back to standard Whisper")
             self._load_standard_whisper()
 
     def normalize_text(self, text: str) -> str:
@@ -97,7 +97,10 @@ class AudioTranscriber:
 
             # Convert to mono if needed
             if audio.shape[0] > 1:
-                audio = audio.mean(dim=0)
+                audio = audio.mean(dim=0, keepdim=True)
+
+            if audio.dim() > 1:
+                audio = audio.squeeze(0)
 
             # Resample to 16kHz for Whisper
             if sr != 16000:
@@ -105,7 +108,9 @@ class AudioTranscriber:
                 audio = resampler(audio)
 
             # Convert to numpy
-            audio_np = audio.numpy()
+            audio_np = audio.numpy().astype('float32')
+            if audio_np.ndim > 1:
+                audio_np = audio_np.flatten()
 
             # Transcribe
             result = self.transcribe_fn(audio_np)
