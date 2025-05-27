@@ -5,6 +5,7 @@ import unicodedata
 from pathlib import Path
 from typing import Dict, List
 import re
+import traceback
 
 import torch
 import torchaudio
@@ -133,6 +134,7 @@ class AudioTranscriber:
             }
 
         except Exception as e:  # pylint: disable=broad-except
+            traceback.print_exc()
             self.logger.error("Error transcribing %s: %s", audio_path, e)
             return {"text": "", "error": str(e), "confidence": 0.0}
 
