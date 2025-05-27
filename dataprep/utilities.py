@@ -40,11 +40,11 @@ def get_module_logger(module_name: str) -> logging.Logger:
 def get_device_info() -> str:
     """Get information about available compute device"""
     if torch.backends.mps.is_available():
-        return "Apple Silicon (MPS)"
+        return "mps"
     elif torch.cuda.is_available():
-        return f"CUDA (GPU: {torch.cuda.get_device_name()})"
+        return "cuda"
     else:
-        return "CPU"
+        return "cpu"
 
 
 def check_dependencies() -> List[str]:
