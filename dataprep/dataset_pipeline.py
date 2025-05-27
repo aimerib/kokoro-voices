@@ -935,9 +935,7 @@ def main():
         print(
             f"📊 Total segments: {results['dataset_stats'].get('total_segments', 0)}")
         print(
-            f"⏱️  Total duration: {
-                results['dataset_stats'].get('total_duration_hours', 0):.1f
-            } hours"
+            f"⏱️  Total duration: {results['dataset_stats'].get('total_duration_hours', 0):.1f} hours"
         )
         if results.get("quality_report"):
             print(

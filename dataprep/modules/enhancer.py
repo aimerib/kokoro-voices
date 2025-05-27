@@ -2,7 +2,7 @@
 """Audio enhancement module combining DeepFilter, VoiceFixer, and MetricGAN+"""
 
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+# from tempfile import NamedTemporaryFile
 import time
 
 import torch
@@ -72,7 +72,8 @@ class AudioEnhancer:
         if self.config["use_deepfilter"]:
             self.logger.info("Loading DeepFilter model...")
 
-            self.df_model, self.df_state, _ = init_df(default_model="DeepFilterNet3")
+            self.df_model, self.df_state, _ = init_df(
+                default_model="DeepFilterNet3")
 
         if self.config["use_voicefixer"]:
             self.logger.info("Loading VoiceFixer model...")
@@ -111,7 +112,8 @@ class AudioEnhancer:
         audio = self._normalize_audio(audio)
 
         output_path = (
-            self.output_dir / f"{input_path.parent.name.strip()}_enhanced_{input_path.name}"
+            self.output_dir /
+            f"{input_path.parent.name.strip()}_enhanced_{input_path.name}"
         )
         torchaudio.save(output_path, audio, sr)
 
@@ -141,7 +143,8 @@ class AudioEnhancer:
                 overlap_sec=overlap_sec,
             )
         ):
-            enhanced_chunk = enhance(self.df_model, self.df_state, chunk, pad=True)
+            enhanced_chunk = enhance(
+                self.df_model, self.df_state, chunk, pad=True)
 
             # Skip first ``overlap`` samples on all but first chunk to avoid duplication
             if i > 0 and overlap_samples > 0:
@@ -198,7 +201,6 @@ class AudioEnhancer:
         # )
         # return processed
 
-
         #     with NamedTemporaryFile(suffix=".wav", delete=False) as f_in, \
         #          NamedTemporaryFile(suffix=".wav", delete=False) as f_out:
         #         torchaudio.save(f_in.name, chunk, sample_rate=int(sr))
@@ -224,11 +226,10 @@ class AudioEnhancer:
 
         #     total_chunks += 1
 
-        # self.logger.info(
-        #     "Completed VoiceFixer processing in %.2fs (%d chunks)",
-        #     time.time() - start_time,
-        #     total_chunks,
-        # )
+        self.logger.info(
+            "Completed VoiceFixer processing in %.2fs",
+            time.time() - start_time,
+        )
         # return processed
         return hwav[None]
 
