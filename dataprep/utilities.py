@@ -15,19 +15,20 @@ def setup_logging(level: int = logging.INFO):
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True  # Override any existing configuration
     )
-    
+
     # Set up root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(level)
-    
+
     # Make sure our loggers are at the right level
     for module in ["dataprep", "__main__"]:
         logger = logging.getLogger(module)
         logger.setLevel(level)
-    
+
     # Suppress some noisy loggers
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
+
 
 def get_module_logger(module_name: str) -> logging.Logger:
     """Get a logger for a specific module"""
