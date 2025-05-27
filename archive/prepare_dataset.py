@@ -19,6 +19,8 @@ import torchaudio
 import numpy as np
 import re
 import random
+import json
+import traceback
 from pathlib import Path
 from tqdm import tqdm
 import shutil
@@ -57,13 +59,142 @@ def trim_silence(wav: torch.Tensor, sr: int, thr_db: float = -35.0):
     return wav[first:last+1]
 
 def phoneme_histogram(texts):
-    phones = phonemize(texts, language='en-us', backend='espeak', strip=True)
-    counts = Counter(' '.join(phones).split())
-    return counts
+    """Generate phoneme distribution from texts"""
+    if not PHONEMIZER_AVAILABLE:
+        print("⚠️  Phonemizer not available - skipping phoneme analysis")
+        return None
+    
+    try:
+        phones = phonemize(texts, language='en-us', backend='espeak', strip=True)
+        counts = Counter(' '.join(phones).split())
+        return counts
+    except Exception as e:
+        print(f"⚠️  Phoneme analysis failed: {e}")
+        return None
+
+def analyze_phoneme_distribution(texts: list) -> dict:
+    """Comprehensive phoneme distribution analysis"""
+    if not PHONEMIZER_AVAILABLE:
+        print("⚠️  Phonemizer not available - install espeak-ng and phonemizer for phoneme analysis")
+        return {}
+    
+    try:
+        print("🔍 Analyzing phoneme distribution...")
+        
+        # Get phonemes for all texts
+        all_phonemes = []
+        for text in tqdm(texts, desc="Processing phonemes"):
+            try:
+                phones = phonemize(text, language='en-us', backend='espeak', strip=True)
+                all_phonemes.extend(phones.split())
+            except Exception as e:
+                print(f"⚠️  Failed to phonemize: '{text[:50]}...' - {e}")
+                continue
+        
+        if not all_phonemes:
+            print("⚠️  No phonemes extracted")
+            return {}
+        
+        # Count phonemes
+        phoneme_counts = Counter(all_phonemes)
+        total_phonemes = sum(phoneme_counts.values())
+        
+        # Calculate percentages
+        phoneme_percentages = {
+            phoneme: (count / total_phonemes) * 100 
+            for phoneme, count in phoneme_counts.items()
+        }
+        
+        # Sort by frequency
+        sorted_phonemes = sorted(phoneme_percentages.items(), key=lambda x: x[1], reverse=True)
+        
+        # Categorize phonemes
+        vowels = ['i', 'ɪ', 'e', 'ɛ', 'æ', 'ɑ', 'ɔ', 'o', 'ʊ', 'u', 'ʌ', 'ə', 'ɚ', 'ɛɹ', 'aɪ', 'aʊ', 'ɔɪ']
+        consonants = ['p', 'b', 't', 'd', 'k', 'g', 'f', 'v', 'θ', 'ð', 's', 'z', 'ʃ', 'ʒ', 'h', 'm', 'n', 'ŋ', 'l', 'ɹ', 'w', 'j']
+        
+        vowel_count = sum(phoneme_counts.get(v, 0) for v in vowels)
+        consonant_count = sum(phoneme_counts.get(c, 0) for c in consonants)
+        other_count = total_phonemes - vowel_count - consonant_count
+        
+        # Create analysis report
+        analysis = {
+            'total_phonemes': total_phonemes,
+            'unique_phonemes': len(phoneme_counts),
+            'phoneme_counts': phoneme_counts,
+            'phoneme_percentages': phoneme_percentages,
+            'sorted_phonemes': sorted_phonemes,
+            'coverage': {
+                'vowels': vowel_count,
+                'consonants': consonant_count,
+                'other': other_count,
+                'vowel_percentage': (vowel_count / total_phonemes) * 100,
+                'consonant_percentage': (consonant_count / total_phonemes) * 100
+            },
+            'top_10_phonemes': sorted_phonemes[:10],
+            'rare_phonemes': [p for p, pct in sorted_phonemes if pct < 0.5]  # Less than 0.5%
+        }
+        
+        return analysis
+        
+    except Exception as e:
+        print(f"⚠️  Phoneme analysis failed: {e}")
+        traceback.print_exc()
+        return {}
+
+def print_phoneme_analysis(analysis: dict):
+    """Print formatted phoneme distribution analysis"""
+    if not analysis:
+        return
+        
+    print("\n" + "="*60)
+    print("📊 PHONEME DISTRIBUTION ANALYSIS")
+    print("="*60)
+    
+    print(f"📈 Total phonemes: {analysis['total_phonemes']:,}")
+    print(f"🔤 Unique phonemes: {analysis['unique_phonemes']}")
+    print(f"🗣️  Vowels: {analysis['coverage']['vowels']:,} ({analysis['coverage']['vowel_percentage']:.1f}%)")
+    print(f"🗨️  Consonants: {analysis['coverage']['consonants']:,} ({analysis['coverage']['consonant_percentage']:.1f}%)")
+    
+    print(f"\n🔥 Top 10 Most Common Phonemes:")
+    for i, (phoneme, percentage) in enumerate(analysis['top_10_phonemes'], 1):
+        count = analysis['phoneme_counts'][phoneme]
+        print(f"   {i:2d}. /{phoneme}/ - {percentage:5.2f}% ({count:,} occurrences)")
+    
+    if analysis['rare_phonemes']:
+        print(f"\n⚠️  Rare phonemes (<0.5%): {len(analysis['rare_phonemes'])} phonemes")
+        rare_list = ', '.join([f"/{p}/" for p, _ in analysis['rare_phonemes'][:10]])
+        if len(analysis['rare_phonemes']) > 10:
+            rare_list += f" ... and {len(analysis['rare_phonemes']) - 10} more"
+        print(f"   {rare_list}")
+    
+    print("="*60)
+
+def save_phoneme_analysis(analysis: dict, output_dir: str):
+    """Save phoneme analysis to JSON file"""
+    if not analysis:
+        return
+        
+    # Convert Counter objects to regular dicts for JSON serialization
+    json_analysis = {
+        'total_phonemes': analysis['total_phonemes'],
+        'unique_phonemes': analysis['unique_phonemes'],
+        'phoneme_counts': dict(analysis['phoneme_counts']),
+        'phoneme_percentages': analysis['phoneme_percentages'],
+        'sorted_phonemes': analysis['sorted_phonemes'],
+        'coverage': analysis['coverage'],
+        'top_10_phonemes': analysis['top_10_phonemes'],
+        'rare_phonemes': analysis['rare_phonemes']
+    }
+    
+    phoneme_file = os.path.join(output_dir, 'phoneme_analysis.json')
+    with open(phoneme_file, 'w', encoding='utf-8') as f:
+        json.dump(json_analysis, f, indent=2, ensure_ascii=False)
+    
+    print(f"💾 Phoneme analysis saved to: {phoneme_file}")
 
 # Used when exporting to HuggingFace
 from huggingface_hub import HfApi, upload_folder
-def upload_to_hf(dataset_dir: str, repo_id: str, private: bool = True, exists_ok:bool = False, duration: float = None, num_clips: int = None):
+def upload_to_hf(dataset_dir: str, repo_id: str, private: bool = True, exists_ok:bool = False, duration: float = None, num_clips: int = None, phoneme_analysis: dict = None):
     """
     Push an entire dataset directory to the Hugging Face Hub.
 
@@ -72,6 +203,7 @@ def upload_to_hf(dataset_dir: str, repo_id: str, private: bool = True, exists_ok
         repo_id: e.g. "aimeri/my-voice-demo"
         private: create a private repo (recommended for gated datasets)
         gated:   put the repo behind the Hub's "Access request" gate
+        phoneme_analysis: optional phoneme distribution analysis
     """
     api = HfApi()
 
@@ -83,7 +215,7 @@ def upload_to_hf(dataset_dir: str, repo_id: str, private: bool = True, exists_ok
             exist_ok=exists_ok,
             repo_type="dataset",
         )
-    write_dataset_card(dataset_dir, duration, num_clips)
+    write_dataset_card(dataset_dir, duration, num_clips, phoneme_analysis)
     print(f"Uploading {dataset_dir} → hf://datasets/{repo_id} …")
     upload_folder(
         repo_id=repo_id,
@@ -93,42 +225,10 @@ def upload_to_hf(dataset_dir: str, repo_id: str, private: bool = True, exists_ok
     )
     print("✓ upload complete")
 
-def transcribe(audio, model_name="base"):
-    # Load Whisper model
-    print(f"Loading Whisper {model_name} model...")
-    if torch.backends.mps.is_available():
-        from whisper_mps import whisper
-        return whisper.transcribe(
-            audio,
-            model=model_name,
-            without_timestamps=False,
-            verbose=False,
-            language="en",
-        )
-    else:
-        import whisper
-        model = whisper.load_model(model_name)
-        return model.transcribe(
-            audio,
-            word_timestamps=True,
-            verbose=False,
-            language="en",
-        )
-
-def normalise_text(t: str):
-    t = unicodedata.normalize("NFKC", t)
-    # Expand numbers → words (“2024”→“two thousand twenty-four”)
-    t = re.sub(r'\d+', lambda m: eng.number_to_words(m.group(0)), t)
-    t = re.sub(r'[^a-zA-Z0-9\.,\?!\' ]', '', t)
-    t = re.sub(r'\s+', ' ', t).strip()
-    return t.capitalize()
-
-def ensure_dir(directory):
-    """Ensure a directory exists"""
-    Path(directory).mkdir(parents=True, exist_ok=True)
-    return directory
-
-def write_dataset_card(out_dir: str, duration_min: float, num_clips: int):
+def write_dataset_card(out_dir: str, duration_min: float, num_clips: int, phoneme_analysis: dict = None):
+    """Write dataset README with phoneme analysis"""
+    
+    # Base content
     text = f"""---
 license: cc-by-nc-nd-4.0
 dataset_type: audio
@@ -168,7 +268,71 @@ Each split directory contains its own metadata.jsonl file with the format:
 {{"file_name": "segment_000.wav", "text": "Transcription text"}}
 ```
 """
+
+    # Add phoneme analysis if available
+    if phoneme_analysis and phoneme_analysis.get('total_phonemes', 0) > 0:
+        text += f"""
+### Phoneme Distribution Analysis
+
+This dataset contains **{phoneme_analysis['total_phonemes']:,} total phonemes** with **{phoneme_analysis['unique_phonemes']} unique phonemes**.
+
+**Coverage:**
+- 🗣️ Vowels: {phoneme_analysis['coverage']['vowels']:,} ({phoneme_analysis['coverage']['vowel_percentage']:.1f}%)
+- 🗨️ Consonants: {phoneme_analysis['coverage']['consonants']:,} ({phoneme_analysis['coverage']['consonant_percentage']:.1f}%)
+
+**Top 10 Most Common Phonemes:**
+"""
+        
+        for i, (phoneme, percentage) in enumerate(phoneme_analysis['top_10_phonemes'], 1):
+            count = phoneme_analysis['phoneme_counts'][phoneme]
+            text += f"{i:2d}. `/{phoneme}/` - {percentage:5.2f}% ({count:,} occurrences)\n"
+        
+        if phoneme_analysis.get('rare_phonemes'):
+            rare_count = len(phoneme_analysis['rare_phonemes'])
+            text += f"\n**Note:** {rare_count} rare phonemes (<0.5% frequency) detected. "
+            text += "Consider adding more diverse content for comprehensive phoneme coverage.\n"
+        
+        text += f"\n*Full phoneme analysis available in `phoneme_analysis.json`*\n"
+    
+    else:
+        text += "\n*Note: Phoneme analysis not available (requires espeak-ng and phonemizer)*\n"
+    
     (Path(out_dir)/"README.md").write_text(text)
+
+def transcribe(audio, model_name="base"):
+    # Load Whisper model
+    print(f"Loading Whisper {model_name} model...")
+    if torch.backends.mps.is_available():
+        from whisper_mps import whisper
+        return whisper.transcribe(
+            audio,
+            model=model_name,
+            without_timestamps=False,
+            verbose=False,
+            language="en",
+        )
+    else:
+        import whisper
+        model = whisper.load_model(model_name)
+        return model.transcribe(
+            audio,
+            word_timestamps=True,
+            verbose=False,
+            language="en",
+        )
+
+def normalise_text(t: str):
+    t = unicodedata.normalize("NFKC", t)
+    # Expand numbers → words (“2024”→“two thousand twenty-four”)
+    t = re.sub(r'\d+', lambda m: eng.number_to_words(m.group(0)), t)
+    t = re.sub(r'[^a-zA-Z0-9\.,\?!\' ]', '', t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t.capitalize()
+
+def ensure_dir(directory):
+    """Ensure a directory exists"""
+    Path(directory).mkdir(parents=True, exist_ok=True)
+    return directory
 
 def load_audio(file_path, sr=16000):
     """Load audio file and convert to the target sample rate"""
@@ -188,7 +352,6 @@ def load_audio(file_path, sr=16000):
     except Exception as e:
         print(f"Error loading audio file: {e}")
         raise
-
 
 def segment_audio(audio, sample_rate, segments, min_duration=1.0, max_duration=10.0):
     """
@@ -369,17 +532,27 @@ def prepare_dataset(input_path, output_dir, model_name="base", seed=1985):
     print(f"Found {len(segments)} segments, saving to {output_dir} with train/validation/test splits...")
     num_clips = save_dataset(segments, output_dir, seed=seed)
 
-    if PHONEMIZER_AVAILABLE:
-        hist = phoneme_histogram([t for _,t,_,_ in segments])
-        rare = [p for p,c in hist.items() if c < 5]
-        print(f"Phonemes with <5 examples: {', '.join(rare)}")
-    
+    texts = [t for _, t, _, _ in segments]
+    if texts:
+        print("\n🔬 Analyzing phoneme distribution...")
+        phoneme_analysis = analyze_phoneme_distribution(texts)
+        print_phoneme_analysis(phoneme_analysis)
+        
+        # Save phoneme analysis
+        phoneme_report_path = Path(output_dir) / "phoneme_analysis.json"
+        with open(phoneme_report_path, 'w', encoding='utf-8') as f:
+            json.dump(phoneme_analysis, f, indent=2, default=str)
+        print(f"📊 Phoneme analysis saved: {phoneme_report_path}")
+    else:
+        phoneme_analysis = None
+        print("⚠️  No text data - skipping phoneme analysis")
+
     duration_min = total_runtime / 60
     print(f"Done! Dataset ready for training.")
     print(f"Total audio duration: {duration_min:.1f} minutes")
     print(f"To train: python training.py --data {output_dir}")
 
-    return num_clips, duration_min
+    return num_clips, duration_min, phoneme_analysis
 
 
 if __name__ == "__main__":
@@ -401,7 +574,7 @@ if __name__ == "__main__":
     
 
     # Prepare dataset
-    num_clips, duration = prepare_dataset(args.input, args.output, args.model, args.seed)
+    num_clips, duration, phoneme_analysis = prepare_dataset(args.input, args.output, args.model, args.seed)
     if args.upload_hf:
         if not args.hf_repo:
             raise ValueError("--upload-hf requires --hf-repo")
@@ -412,6 +585,7 @@ if __name__ == "__main__":
             exists_ok=args.hf_exists_ok,
             duration=duration,
             num_clips=num_clips,
+            phoneme_analysis=phoneme_analysis,
         )
         if args.cleanup_after_upload:
             shutil.rmtree(args.output)
