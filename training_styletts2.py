@@ -671,7 +671,8 @@ def train_kokoro_projection(
     epochs: int = 100,
     lr: float = 1e-3,
     device: str = "cpu",
-    logger: Optional[TrainingLogger] = None
+    logger: Optional[TrainingLogger] = None,
+    log_audio_every: int = 10
 ) -> StyleToKokoroProjection:
     """
     Train projection layer from StyleTTS2 to Kokoro embedding space.
@@ -686,6 +687,7 @@ def train_kokoro_projection(
         lr: Learning rate
         device: Device for training
         logger: Training logger
+        log_audio_every: Frequency of audio logging
         
     Returns:
         Trained projection layer
@@ -951,6 +953,29 @@ def train_kokoro_projection(
                             projection.projection[-2].weight.data.cpu().numpy()
                         )
                     })
+                
+                # Generate and log audio samples every log_audio_every epochs
+                if logger.use_wandb and WANDB_AVAILABLE and log_audio_every > 0 and epoch % log_audio_every == 0:
+                    try:
+                        print(f"Generating audio samples for epoch {epoch}...")
+                        audio_samples = generate_audio_samples_for_logging(
+                            current_kokoro_embedding, 
+                            kokoro_model, 
+                            g2p, 
+                            device
+                        )
+                        
+                        for i, (text, audio_tensor) in enumerate(audio_samples):
+                            wandb.log({
+                                f"generated_audio_epoch_{epoch}_sample_{i+1}": wandb.Audio(
+                                    audio_tensor.cpu().numpy(),
+                                    sample_rate=24000,
+                                    caption=f"Epoch {epoch}: {text}"
+                                )
+                            })
+                        
+                    except Exception as e:
+                        print(f"Warning: Audio generation failed for epoch {epoch}: {e}")
             
             # Save best model
             if avg_loss < best_loss:
@@ -960,6 +985,84 @@ def train_kokoro_projection(
     
     print(f"Projection training completed. Best loss: {best_loss:.4f}")
     return projection
+
+def generate_audio_samples_for_logging(
+    kokoro_embedding: torch.Tensor, 
+    kokoro_model, 
+    g2p, 
+    device: str,
+    test_texts: List[str] = None
+) -> List[Tuple[str, torch.Tensor]]:
+    """
+    Generate audio samples for logging during training.
+    
+    Args:
+        kokoro_embedding: Current Kokoro embedding from projection
+        kokoro_model: Kokoro TTS model
+        g2p: G2P pipeline
+        device: Device for computation
+        test_texts: List of test texts (optional)
+        
+    Returns:
+        List of (text, audio_tensor) tuples
+    """
+    if test_texts is None:
+        test_texts = [
+            "Hello, this is a test.",
+            "The quick brown fox jumps.",
+            "How are you today?"
+        ]
+    
+    audio_samples = []
+    
+    # Ensure embedding has right format for Kokoro
+    if kokoro_embedding.dim() == 1:
+        kokoro_embedding = kokoro_embedding.unsqueeze(0)
+    
+    # Expand to full Kokoro voice tensor format
+    MAX_PHONEME_LEN = 510
+    kokoro_voice_tensor = torch.zeros((MAX_PHONEME_LEN, 1, 256), device=device)
+    
+    for i in range(MAX_PHONEME_LEN):
+        length_factor = 1.0 + (i / MAX_PHONEME_LEN) * 0.05
+        varied_embedding = kokoro_embedding.squeeze() * length_factor
+        kokoro_voice_tensor[i, 0, :] = varied_embedding
+    
+    for text in test_texts:
+        try:
+            # Convert text to phonemes
+            phonemes, _ = g2p.g2p(text)
+            if not phonemes or len(phonemes) == 0:
+                continue
+            
+            # Convert to input IDs
+            ids = [0]  # BOS
+            ids.extend(kokoro_model.vocab.get(p) for p in phonemes if kokoro_model.vocab.get(p) is not None)
+            ids.append(0)  # EOS
+            input_ids = torch.tensor(ids, dtype=torch.long).unsqueeze(0).to(device)
+            
+            if input_ids.shape[1] < 3:
+                continue
+            
+            # Generate audio
+            with torch.no_grad():
+                generated_audio, _ = kokoro_model.forward_with_tokens(
+                    input_ids, 
+                    kokoro_embedding
+                )
+            
+            # Trim to reasonable length (max 5 seconds)
+            max_samples = 24000 * 5
+            if generated_audio.shape[-1] > max_samples:
+                generated_audio = generated_audio[..., :max_samples]
+            
+            audio_samples.append((text, generated_audio.squeeze()))
+            
+        except Exception as e:
+            print(f"Warning: Failed to generate audio for '{text}': {e}")
+            continue
+    
+    return audio_samples
 
 # ---------------------------------------------------------------------------
 # Main Training Pipeline
@@ -976,7 +1079,8 @@ def train_styletts2_to_kokoro(
     wandb_project: Optional[str] = None,
     wandb_name: Optional[str] = None,
     max_style_samples: int = 100,
-    device: str = "auto"
+    device: str = "auto",
+    log_audio_every: int = 10
 ):
     """
     Complete pipeline: StyleTTS2 style extraction → Kokoro projection
@@ -993,6 +1097,7 @@ def train_styletts2_to_kokoro(
         wandb_name: W&B run name
         max_style_samples: Max samples for style extraction
         device: Device to use
+        log_audio_every: Frequency of audio logging
     """
     
     print("\n" + "="*60)
@@ -1123,7 +1228,8 @@ def train_styletts2_to_kokoro(
             epochs=epochs_projection,
             lr=lr_projection,
             device=device,
-            logger=logger
+            logger=logger,
+            log_audio_every=log_audio_every
         )
         
         # Generate final Kokoro embedding
@@ -1290,6 +1396,7 @@ if __name__ == "__main__":
     # Advanced arguments
     ap.add_argument("--max-style-samples", type=int, default=100, help="Max samples for style extraction")
     ap.add_argument("--device", type=str, default="auto", help="Device to use (auto/cuda/mps/cpu)")
+    ap.add_argument("--log-audio-every", type=int, default=10, help="Log audio samples every N epochs (0 to disable)")
     
     args = ap.parse_args()
     
@@ -1319,5 +1426,6 @@ if __name__ == "__main__":
         wandb_project=args.wandb_project,
         wandb_name=args.wandb_name,
         max_style_samples=args.max_style_samples,
-        device=args.device
+        device=args.device,
+        log_audio_every=args.log_audio_every
     ) 
