@@ -186,7 +186,7 @@ This dataset was created using the Kokoro Pipeline for voice cloning with Kokoro
         readme_content += """
 
 ## Dataset Structure
-
+```
 dataset/
 ├── train/
 │   ├── metadata.jsonl
@@ -196,6 +196,7 @@ dataset/
 │   └── segment_.wav
 └── test/
 └── segment_*.wav
+```
 
 Each `metadata.jsonl` contains:
 ```json
