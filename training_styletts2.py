@@ -249,8 +249,9 @@ def load_styletts2_model(device: str = "cpu"):
     if not STYLETTS2_AVAILABLE:
         raise ImportError("StyleTTS2 not installed. `pip install styletts2`. ")
 
+    # StyleTTS2 wrapper is not an nn.Module; keep it on CPU.
     with allow_pickle():
-        model = tts.StyleTTS2().to(device).eval()
+        model = tts.StyleTTS2()
     print("✓ StyleTTS2 model loaded (pip package)")
     return model  # no longer returning model_type
 
@@ -310,7 +311,7 @@ def extract_styletts2_embeddings(
         styletts2_model = load_styletts2_model(device)
     except Exception as e:
         print(f"StyleTTS2 unavailable → fallback to audio-feature extraction ({e})")
-        return extract_audio_features_as_style(dataset, device, max_samples)
+        return extract_audio_features_as_style(dataset, 'cpu', max_samples)
     
     embeddings = []
     
@@ -338,7 +339,7 @@ def extract_styletts2_embeddings(
     
     if not embeddings:
         print("No StyleTTS2 embeddings extracted → fallback to audio features…")
-        return extract_audio_features_as_style(dataset, device, max_samples)
+        return extract_audio_features_as_style(dataset, 'cpu', max_samples)
     
     # Average all embeddings
     avg_embedding = torch.stack(embeddings).mean(0)
