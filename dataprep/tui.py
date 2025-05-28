@@ -494,7 +494,7 @@ This tool will guide you through:
                     "skip_isolation": saved_config.get("skip_isolation", False),
                     "skip_cleaning": saved_config.get("skip_cleaning", False),
                     "enable_deepfilter": saved_config.get("enable_deepfilter", False),
-                    "upload_hf": saved_config.get("upload_hf", False),
+                    "upload_hf": saved_config.get("upload_hf", saved_config.get("upload_to_hf", False)),
                     "hf_repo": saved_config.get("hf_repo"),
                     "hf_private": saved_config.get("hf_private", True)
                 })

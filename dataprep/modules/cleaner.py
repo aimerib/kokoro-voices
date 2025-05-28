@@ -86,7 +86,14 @@ class DatasetCleaner:
                     for issue in issues:
                         quality_report["rejection_reasons"][issue] += 1
 
-                    # Optionally remove bad files
+                    # Remove bad audio file from disk
+                    try:
+                        audio_path.unlink()
+                        self.logger.debug("Removed bad file: %s", audio_path.name)
+                    except Exception as e:
+                        self.logger.warning("Failed to remove %s: %s", audio_path.name, e)
+
+                    # Log rejection details
                     if self.logger.isEnabledFor(logging.DEBUG):
                         self.logger.debug(
                             "Rejected %s: %s", audio_path.name, ", ".join(
