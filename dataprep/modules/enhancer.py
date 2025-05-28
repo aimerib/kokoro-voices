@@ -98,7 +98,14 @@ class AudioEnhancer:
             self.metricgan = SpectralMaskEnhancement.from_hparams(
                 source="speechbrain/metricgan-plus-voicebank", savedir="sb_metricgan"
             )
+        if self.config.get("use_adaptive_enhancement"):
 
+            self.logger.info("Loading models for auto mode...")
+            self.metricgan = SpectralMaskEnhancement.from_hparams(
+                source="speechbrain/metricgan-plus-voicebank", savedir="sb_metricgan"
+            )
+            self.df_model, self.df_state, _ = init_df(
+                default_model="DeepFilterNet3")
         self._models_loaded = True
 
     def process(self, input_path: Path) -> Path:
@@ -114,22 +121,27 @@ class AudioEnhancer:
         if self.config.get("use_adaptive_enhancement"):
             try:
                 # Auto mode - analyze and select methods
-                quality_metrics = self._analyze_audio_quality(audio, sr)
-                selected_methods = self._select_enhancement_methods(
-                    quality_metrics)
-                self.logger.info(f"Selected enhancement methods: {selected_methods}")
-                
-                for method in selected_methods:
-                    if method == "deepfilter":
-                        audio = self._apply_deepfilter(audio, sr)
-                    elif method == "resemble_enhance":
-                        audio = self._apply_resemble_enhance(audio, sr)
-                    elif method == "metricgan":
-                        audio = self._apply_metricgan(audio, sr)
-                    elif method == "spectral_subtraction":
-                        audio = self._apply_spectral_subtraction(audio, sr)
-                    elif method == "pitch_correction":
-                        audio = self._apply_pitch_correction(audio, sr)
+                audio = self._apply_deepfilter(audio, sr)
+                audio = self._apply_metricgan(audio, sr)
+                audio = self._apply_spectral_subtraction(audio, sr)
+                audio = self._apply_pitch_correction(audio, sr)
+                audio = self._apply_resemble_enhance(audio, sr)
+                # quality_metrics = self._analyze_audio_quality(audio, sr)
+                # selected_methods = self._select_enhancement_methods(
+                #     quality_metrics)
+                # self.logger.info(f"Selected enhancement methods: {selected_methods}")
+
+                # for method in selected_methods:
+                #     if method == "deepfilter":
+                #         audio = self._apply_deepfilter(audio, sr)
+                #     elif method == "resemble_enhance":
+                #         audio = self._apply_resemble_enhance(audio, sr)
+                #     elif method == "metricgan":
+                #         audio = self._apply_metricgan(audio, sr)
+                #     elif method == "spectral_subtraction":
+                #         audio = self._apply_spectral_subtraction(audio, sr)
+                #     elif method == "pitch_correction":
+                #         audio = self._apply_pitch_correction(audio, sr)
             except Exception as e:
                 self.logger.error(f"Auto enhancement failed: {str(e)}")
                 # Fallback to no enhancement rather than crashing
@@ -158,6 +170,12 @@ class AudioEnhancer:
 
     def _apply_deepfilter(self, audio: torch.Tensor, sr: int) -> torch.Tensor:
         """Apply DeepFilter denoising with chunking"""
+
+        # Check if models are loaded
+        if self.df_model is None or self.df_state is None:
+            self.logger.warning(
+                "DeepFilter models not loaded, skipping denoising")
+            return audio
 
         # Resample to 48kHz if needed (DeepFilter expects 48 kHz)
         if sr != 48000:
@@ -234,6 +252,13 @@ class AudioEnhancer:
 
     def _apply_metricgan(self, audio: torch.Tensor, sr: int) -> torch.Tensor:
         """Apply MetricGAN+ enhancement"""
+
+        # Check if model is loaded
+        if self.metricgan is None:
+            self.logger.warning(
+                "MetricGAN+ model not loaded, skipping enhancement")
+            return audio
+
         # Resample to 16kHz
         if sr != 16000:
             self.logger.info("Resampling audio to 16kHz")
@@ -363,7 +388,7 @@ class AudioEnhancer:
 
         # Ensure audio is on the same device throughout
         device = audio.device
-        
+
         # Calculate SNR (Signal-to-Noise Ratio)
         energy = torch.mean(audio ** 2)
         snr_db = 10 * torch.log10(energy + 1e-10)
