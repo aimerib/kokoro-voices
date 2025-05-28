@@ -596,6 +596,133 @@ def estimate_pitch_features(audio: torch.Tensor, sample_rate: int) -> torch.Tens
         return torch.zeros(4)
 
 # ---------------------------------------------------------------------------
+# Voice Similarity Loss Functions
+# ---------------------------------------------------------------------------
+
+def compute_voice_similarity_loss(
+    kokoro_embedding: torch.Tensor,
+    target_audio: torch.Tensor,
+    generated_audio: torch.Tensor,
+    mel_transform,
+    device: str
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Compute a proper voice similarity loss that compares generated audio
+    with target audio using perceptually meaningful metrics.
+    
+    Args:
+        kokoro_embedding: The projected Kokoro embedding
+        target_audio: Target voice audio
+        generated_audio: Audio generated with current embedding
+        mel_transform: Mel spectrogram transform
+        device: Device for computation
+        
+    Returns:
+        Tuple of (total_loss, loss_components_dict)
+    """
+    loss_components = {}
+    
+    # Ensure audio tensors are the same length
+    min_len = min(target_audio.shape[-1], generated_audio.shape[-1])
+    target_audio = target_audio[..., :min_len]
+    generated_audio = generated_audio[..., :min_len]
+    
+    # Convert to mel spectrograms
+    target_mel = mel_transform(target_audio.unsqueeze(0) if target_audio.dim() == 1 else target_audio)
+    generated_mel = mel_transform(generated_audio.unsqueeze(0) if generated_audio.dim() == 1 else generated_audio)
+    
+    # Ensure same mel dimensions
+    min_mel_time = min(target_mel.shape[-1], generated_mel.shape[-1])
+    target_mel = target_mel[..., :min_mel_time]
+    generated_mel = generated_mel[..., :min_mel_time]
+    
+    # 1. Mel Spectrogram L1 Loss (primary reconstruction loss)
+    mel_l1_loss = F.l1_loss(generated_mel, target_mel)
+    loss_components['mel_l1_loss'] = mel_l1_loss.item()
+    
+    # 2. Spectral Convergence Loss (normalized reconstruction)
+    spectral_conv_loss = torch.norm(generated_mel - target_mel, p='fro') / (torch.norm(target_mel, p='fro') + 1e-8)
+    loss_components['spectral_conv_loss'] = spectral_conv_loss.item()
+    
+    # 3. Perceptual Similarity Loss (cosine similarity in mel space)
+    # Flatten mel spectrograms for cosine similarity
+    target_mel_flat = target_mel.reshape(target_mel.shape[0], -1)
+    generated_mel_flat = generated_mel.reshape(generated_mel.shape[0], -1)
+    
+    # Normalize for cosine similarity
+    target_mel_norm = F.normalize(target_mel_flat, p=2, dim=1)
+    generated_mel_norm = F.normalize(generated_mel_flat, p=2, dim=1)
+    
+    # Cosine similarity loss (maximize similarity = minimize 1 - cosine)
+    cosine_sim = (target_mel_norm * generated_mel_norm).sum(dim=1).mean()
+    cosine_loss = 1.0 - cosine_sim
+    loss_components['cosine_loss'] = cosine_loss.item()
+    
+    # 4. Spectral Centroid Matching (voice timbre preservation)
+    freq_bins = torch.arange(target_mel.shape[1], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(-1)
+    
+    target_centroid = (freq_bins * target_mel).sum(dim=1) / (target_mel.sum(dim=1) + 1e-8)
+    generated_centroid = (freq_bins * generated_mel).sum(dim=1) / (generated_mel.sum(dim=1) + 1e-8)
+    
+    centroid_loss = F.l1_loss(generated_centroid, target_centroid)
+    loss_components['centroid_loss'] = centroid_loss.item()
+    
+    # 5. Embedding Regularization (prevent explosion, encourage reasonable norms)
+    # Use a reasonable target norm based on typical Kokoro embeddings (around 0.1-0.2)
+    embedding_norm = torch.norm(kokoro_embedding)
+    target_norm = 0.15  # Reasonable middle ground
+    norm_reg_loss = F.mse_loss(embedding_norm, torch.tensor(target_norm, device=device))
+    loss_components['norm_reg_loss'] = norm_reg_loss.item()
+    
+    # 6. Embedding Smoothness (prevent extreme values)
+    smoothness_loss = torch.mean(torch.abs(kokoro_embedding)) * 0.1  # Encourage smaller absolute values
+    loss_components['smoothness_loss'] = smoothness_loss.item()
+    
+    # Combine losses with weights that prioritize voice similarity
+    total_loss = (
+        0.4 * mel_l1_loss +           # Primary reconstruction loss
+        0.2 * spectral_conv_loss +    # Normalized reconstruction
+        0.2 * cosine_loss +           # Perceptual similarity
+        0.1 * centroid_loss +         # Timbre preservation
+        0.05 * norm_reg_loss +        # Reasonable embedding norm
+        0.05 * smoothness_loss        # Prevent extreme values
+    )
+    
+    loss_components['total_loss'] = total_loss.item()
+    
+    return total_loss, loss_components
+
+def get_reference_kokoro_embedding(device: str) -> torch.Tensor:
+    """
+    Get a reference Kokoro embedding from a known good voice.
+    This provides a reasonable target for embedding characteristics.
+    """
+    try:
+        # Try to load a reference voice from Kokoro's built-in voices
+        from kokoro import KPipeline
+        pipeline = KPipeline(lang_code="a")
+        
+        # Use the default voice as reference (usually a good quality voice)
+        # This gives us a realistic target for embedding characteristics
+        reference_voice = pipeline.voice  # Default voice tensor
+        
+        if reference_voice is not None and reference_voice.dim() == 3:
+            # Average across phoneme positions to get base embedding
+            reference_embedding = reference_voice.mean(dim=0).squeeze()  # [256]
+            return reference_embedding.to(device)
+        else:
+            # Fallback: create a reasonable embedding based on typical Kokoro characteristics
+            # Kokoro embeddings are typically small, centered around 0, with std ~0.1
+            reference = torch.randn(256, device=device) * 0.1
+            return reference
+            
+    except Exception as e:
+        print(f"Warning: Could not load reference embedding: {e}")
+        # Fallback: create a reasonable embedding
+        reference = torch.randn(256, device=device) * 0.1
+        return reference
+
+# ---------------------------------------------------------------------------
 # Kokoro Projection Training
 # ---------------------------------------------------------------------------
 
@@ -677,8 +804,8 @@ def train_kokoro_projection(
     """
     Train projection layer from StyleTTS2 to Kokoro embedding space.
     
-    This uses a contrastive approach where we try to match the acoustic
-    characteristics of generated speech with target audio.
+    This uses a proper voice similarity approach that compares generated
+    audio with target audio using perceptually meaningful metrics.
     
     Args:
         style_embeddings: StyleTTS2 style embeddings
@@ -694,11 +821,10 @@ def train_kokoro_projection(
     """
     
     print("="*60)
-    print("STAGE 2: Kokoro Projection Training")
+    print("STAGE 2: Kokoro Projection Training (Fixed Loss Function)")
     print("="*60)
     
     # Ensure style embeddings are on the right device and don't require grad
-    # (we only want to train the projection, not the input embeddings)
     style_embeddings = style_embeddings.to(device).detach()
     
     # Initialize projection layer
@@ -748,7 +874,7 @@ def train_kokoro_projection(
     kokoro_model = kokoro_model.to(device)
     kokoro_model.eval()
     
-    # Freeze Kokoro model parameters to prevent them from being updated
+    # Freeze Kokoro model parameters
     for param in kokoro_model.parameters():
         param.requires_grad_(False)
     
@@ -762,7 +888,7 @@ def train_kokoro_projection(
         power=1,
     ).to(device)
     
-    # Setup optimizer
+    # Setup optimizer with lower learning rate for stability
     optimizer = torch.optim.Adam(projection.parameters(), lr=lr)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
     
@@ -770,20 +896,21 @@ def train_kokoro_projection(
     from kokoro import KPipeline
     g2p = KPipeline(lang_code="a", model=False)
     
+    # Get reference embedding for comparison
+    reference_embedding = get_reference_kokoro_embedding(device)
+    
     best_loss = float('inf')
+    patience_counter = 0
+    early_stopping_patience = 15  # Stop if no improvement for 15 epochs
+    min_improvement = 1e-4  # Minimum improvement to reset patience
     
     # Log initial embeddings to W&B if available
     if logger and logger.use_wandb and WANDB_AVAILABLE:
-        # Log StyleTTS2 embedding
         styletts2_embedding_np = style_embeddings.cpu().numpy()
         wandb.log({
             "styletts2_embedding": wandb.Histogram(styletts2_embedding_np),
             "styletts2_embedding_pca": wandb.Image(visualize_embedding(styletts2_embedding_np))
         })
-    
-    # Add mel predictor to projection model for training
-    # We'll add this dynamically in the first batch, then update optimizer
-    mel_predictor_added = False
     
     for epoch in range(1, epochs + 1):
         projection.train()
@@ -794,7 +921,7 @@ def train_kokoro_projection(
         epoch_samples = random.sample(target_samples, min(5, len(target_samples)))
         
         batch_losses = []
-        batch_mse_losses = []
+        batch_loss_components = []
         
         for text, target_audio in epoch_samples:
             try:
@@ -818,74 +945,24 @@ def train_kokoro_projection(
                 if kokoro_embedding.dim() == 1:
                     kokoro_embedding = kokoro_embedding.unsqueeze(0)
                 
-                # Instead of full audio generation, use embedding-level training
-                # Get target embedding from Kokoro model's encoder
-                with torch.no_grad():
-                    # Generate reference audio to extract target features
-                    generated_audio, _ = kokoro_model.forward_with_tokens(
-                        input_ids, 
-                        kokoro_embedding.detach()  # Use detached version for reference
-                    )
-                    
-                    # Convert both to mel spectrograms for feature extraction
-                    target_audio = target_audio.to(device)
-                    
-                    # Normalize audio lengths
-                    min_len = min(generated_audio.shape[-1], target_audio.shape[-1])
-                    generated_audio_ref = generated_audio[..., :min_len]
-                    target_audio_trimmed = target_audio[..., :min_len]
-                    
-                    # Convert to mel spectrograms
-                    generated_mel_ref = mel_transform(generated_audio_ref)
-                    target_mel = mel_transform(target_audio_trimmed.unsqueeze(0)).squeeze(0)
+                # Generate audio with current embedding
+                generated_audio, _ = kokoro_model.forward_with_tokens(
+                    input_ids, 
+                    kokoro_embedding
+                )
                 
-                # Create mel predictor if not exists and update optimizer
-                if not hasattr(projection, 'mel_predictor'):
-                    # Use a smaller, more flexible predictor that outputs mel features
-                    projection.mel_predictor = nn.Sequential(
-                        nn.Linear(256, 512),
-                        nn.ReLU(),
-                        nn.Linear(512, 80),  # Output 80 mel bins (frequency dimension)
-                        nn.Tanh()
-                    ).to(device)
-                    # Update optimizer to include new parameters
-                    optimizer = torch.optim.Adam(projection.parameters(), lr=lr)
-                    mel_predictor_added = True
-                    print("Added mel predictor to projection model")
-                
-                # Now compute losses that preserve gradients
-                # 1. Direct embedding regularization loss
-                embedding_reg_loss = F.mse_loss(kokoro_embedding, torch.zeros_like(kokoro_embedding)) * 0.01
-                
-                # 2. Embedding norm loss (encourage reasonable magnitudes)
-                target_norm = 0.1  # Typical Kokoro embedding norm
-                norm_loss = F.mse_loss(torch.norm(kokoro_embedding), torch.tensor(target_norm, device=device)) * 0.1
-                
-                # 3. Embedding smoothness loss (encourage stable embeddings)
-                smoothness_loss = torch.mean(kokoro_embedding ** 2) * 0.01
-                
-                # 4. Spectral characteristics matching
-                # Generate predicted mel features (frequency profile)
-                embedding_flat = kokoro_embedding.view(-1)  # Flatten to 1D
-                predicted_mel_profile = projection.mel_predictor(embedding_flat)  # [80] - frequency profile
-                
-                # Compare with average frequency profile of target
-                target_mel_profile = target_mel.mean(dim=1)  # Average over time -> [80]
-                
-                # Spectral loss - compare frequency profiles
-                spectral_loss = F.mse_loss(predicted_mel_profile, target_mel_profile.detach())
-                
-                # 5. Additional embedding consistency loss
-                # Encourage the embedding to be similar to a "canonical" voice embedding
-                canonical_embedding = torch.randn_like(kokoro_embedding) * 0.05  # Small random target
-                consistency_loss = F.mse_loss(kokoro_embedding, canonical_embedding.detach()) * 0.001
-                
-                # Combine losses
-                loss = spectral_loss + embedding_reg_loss + norm_loss + smoothness_loss + consistency_loss
+                # Compute voice similarity loss
+                loss, loss_components = compute_voice_similarity_loss(
+                    kokoro_embedding.squeeze(),
+                    target_audio.to(device),
+                    generated_audio.squeeze(),
+                    mel_transform,
+                    device
+                )
                 
                 # Verify loss has gradients
                 if not loss.requires_grad:
-                    print("Warning: Combined loss still doesn't require grad - skipping batch")
+                    print("Warning: Loss doesn't require grad - skipping batch")
                     continue
                 
                 # Backward pass
@@ -898,7 +975,7 @@ def train_kokoro_projection(
                 valid_batches += 1
                 
                 batch_losses.append(loss.item())
-                batch_mse_losses.append(spectral_loss.item())
+                batch_loss_components.append(loss_components)
                 
             except Exception as e:
                 print(f"Warning: Batch failed: {e}")
@@ -908,8 +985,22 @@ def train_kokoro_projection(
             avg_loss = epoch_loss / valid_batches
             scheduler.step(avg_loss)
             
-            if epoch % 10 == 0:
-                print(f"Epoch {epoch}/{epochs}: Loss = {avg_loss:.4f}")
+            # Early stopping logic
+            if avg_loss < best_loss - min_improvement:
+                best_loss = avg_loss
+                patience_counter = 0
+                print(f"Epoch {epoch}/{epochs}: Loss = {avg_loss:.4f} (New best!)")
+            else:
+                patience_counter += 1
+                if epoch % 10 == 0:
+                    print(f"Epoch {epoch}/{epochs}: Loss = {avg_loss:.4f} (No improvement for {patience_counter} epochs)")
+            
+            # Check for early stopping
+            if patience_counter >= early_stopping_patience:
+                print(f"\nEarly stopping triggered at epoch {epoch}")
+                print(f"No improvement for {early_stopping_patience} epochs")
+                print(f"Best loss: {best_loss:.4f}")
+                break
             
             # Project the StyleTTS2 embedding to visualize training progress
             with torch.no_grad():
@@ -925,6 +1016,12 @@ def train_kokoro_projection(
             grad_norm = grad_norm ** 0.5
             param_norm = param_norm ** 0.5
             
+            # Average loss components across batches
+            avg_loss_components = {}
+            if batch_loss_components:
+                for key in batch_loss_components[0].keys():
+                    avg_loss_components[key] = np.mean([comp[key] for comp in batch_loss_components])
+            
             # Log metrics
             metrics = {
                 'projection_loss': avg_loss,
@@ -934,18 +1031,20 @@ def train_kokoro_projection(
                 'param_norm': param_norm,
                 'embedding_norm': torch.norm(current_kokoro_embedding).item(),
                 'batch_loss_std': np.std(batch_losses) if batch_losses else 0,
-                'batch_mse_std': np.std(batch_mse_losses) if batch_mse_losses else 0
+                'best_loss': best_loss,
+                'patience_counter': patience_counter,
             }
+            
+            # Add individual loss components
+            metrics.update(avg_loss_components)
             
             if logger:
                 logger.log_metrics(metrics)
                 
                 # Additional W&B-specific logging
                 if logger.use_wandb and WANDB_AVAILABLE and epoch % 10 == 0:
-                    # Log the embedding distribution
                     kokoro_embedding_np = current_kokoro_embedding.numpy()
                     
-                    # Log histograms of embedding values
                     wandb.log({
                         "kokoro_embedding": wandb.Histogram(kokoro_embedding_np),
                         "kokoro_embedding_pca": wandb.Image(visualize_embedding(kokoro_embedding_np)),
@@ -954,7 +1053,7 @@ def train_kokoro_projection(
                         )
                     })
                 
-                # Generate and log audio samples every log_audio_every epochs
+                # Generate and log audio samples
                 if logger.use_wandb and WANDB_AVAILABLE and log_audio_every > 0 and epoch % log_audio_every == 0:
                     try:
                         print(f"Generating audio samples for epoch {epoch}...")
@@ -976,10 +1075,6 @@ def train_kokoro_projection(
                         
                     except Exception as e:
                         print(f"Warning: Audio generation failed for epoch {epoch}: {e}")
-            
-            # Save best model
-            if avg_loss < best_loss:
-                best_loss = avg_loss
         else:
             print(f"Epoch {epoch}: No valid batches")
     
@@ -1079,8 +1174,8 @@ def generate_audio_samples_for_logging(
 
 def train_styletts2_to_kokoro(
     data_root: str | Path,
-    epochs_projection: int = 100,
-    lr_projection: float = 1e-3,
+    epochs_projection: int = 50,  # Reduced from 100 to prevent overtraining
+    lr_projection: float = 5e-4,  # Reduced from 1e-3 for more stability
     out: str = "output",
     name: str = "my_voice",
     use_tensorboard: bool = False,
@@ -1089,15 +1184,17 @@ def train_styletts2_to_kokoro(
     wandb_name: Optional[str] = None,
     max_style_samples: int = 100,
     device: str = "auto",
-    log_audio_every: int = 10
+    log_audio_every: int = 10,
+    early_stopping_patience: int = 15,  # Stop if no improvement for 15 epochs
+    min_improvement: float = 1e-4  # Minimum improvement threshold
 ):
     """
     Complete pipeline: StyleTTS2 style extraction → Kokoro projection
     
     Args:
         data_root: Path to dataset
-        epochs_projection: Epochs for projection training
-        lr_projection: Learning rate for projection
+        epochs_projection: Epochs for projection training (reduced default)
+        lr_projection: Learning rate for projection (reduced default)
         out: Output directory
         name: Voice name
         use_tensorboard: Enable TensorBoard logging
@@ -1107,14 +1204,17 @@ def train_styletts2_to_kokoro(
         max_style_samples: Max samples for style extraction
         device: Device to use
         log_audio_every: Frequency of audio logging
+        early_stopping_patience: Early stopping patience
+        min_improvement: Minimum improvement threshold
     """
     
     print("\n" + "="*60)
-    print("StyleTTS2 → Kokoro Voice Embedding Pipeline")
+    print("StyleTTS2 → Kokoro Voice Embedding Pipeline (Fixed)")
     print("="*60)
     print(f"Dataset: {data_root}")
     print(f"Output: {out}/{name}")
-    print(f"Projection epochs: {epochs_projection}")
+    print(f"Projection epochs: {epochs_projection} (with early stopping)")
+    print(f"Learning rate: {lr_projection}")
     print("="*60 + "\n")
     
     # Setup device
@@ -1142,8 +1242,10 @@ def train_styletts2_to_kokoro(
             "max_style_samples": max_style_samples,
             "device": device,
             "styletts2_available": STYLETTS2_AVAILABLE,
-            "pipeline_version": "1.0",
-            "datetime": datetime.datetime.now().isoformat()
+            "pipeline_version": "2.0_fixed",  # Updated version
+            "datetime": datetime.datetime.now().isoformat(),
+            "early_stopping_patience": early_stopping_patience,
+            "min_improvement": min_improvement
         }
         if not wandb.run:
             wandb.init(
@@ -1229,7 +1331,7 @@ def train_styletts2_to_kokoro(
             text, audio, _ = train_dataset[idx]
             target_samples.append((text, audio))
         
-        # Stage 2: Train Kokoro projection
+        # Stage 2: Train Kokoro projection with improved parameters
         print("\nStarting Stage 2: Kokoro Projection Training...")
         projection_model = train_kokoro_projection(
             style_embeddings=avg_style_embedding,
@@ -1287,7 +1389,9 @@ def train_styletts2_to_kokoro(
                 'epochs_projection': epochs_projection,
                 'lr_projection': lr_projection,
                 'max_style_samples': max_style_samples,
-                'device': device
+                'device': device,
+                'early_stopping_patience': early_stopping_patience,
+                'min_improvement': min_improvement
             }
         }
         
@@ -1389,8 +1493,8 @@ if __name__ == "__main__":
     ap.add_argument("--dataset-id", type=str, help='HF dataset repo ID (e.g. "user/dataset")')
     
     # Training arguments
-    ap.add_argument("--epochs-projection", type=int, default=100, help="Epochs for projection training")
-    ap.add_argument("--lr-projection", type=float, default=1e-3, help="Learning rate for projection")
+    ap.add_argument("--epochs-projection", type=int, default=50, help="Epochs for projection training (reduced default)")
+    ap.add_argument("--lr-projection", type=float, default=5e-4, help="Learning rate for projection (reduced default)")
     
     # Output arguments
     ap.add_argument("--name", type=str, default="my_voice", help="Output voice name")
