@@ -1177,7 +1177,7 @@ def train(
                             is_reference=False
                         )
 
-                        similarity_metrics = calculate_audio_similarity(voice_embedding, sample_target_audio, sample_text, device)
+                        similarity_metrics = calculate_audio_similarity(voice_embedding, sample_target_audio, sample_text, sr=24000)
                         logger.log_metrics(similarity_metrics)
                         print(f"Logged audio samples for epoch {epoch}")
                         
