@@ -49,6 +49,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+import librosa  # simplified audio IO / resampling for StyleTTS2
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
@@ -72,13 +73,18 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
-# StyleTTS2 imports - will be installed as dependency
+# ------------------------- StyleTTS2 -------------------------
+# We rely on the lightweight pip package which already bundles
+# a convenience wrapper (`styletts2.tts.StyleTTS2`) exposing a
+# `compute_style()` helper.  No manual checkpoints or YAML files
+# are necessary.
+
 try:
-    from styletts2 import tts
+    from styletts2 import tts  # pip install styletts2
     STYLETTS2_AVAILABLE = True
 except ImportError:
-    print("StyleTTS2 not found. Install with: pip install styletts2")
     STYLETTS2_AVAILABLE = False
+    print("StyleTTS2 not found. Install with: pip install styletts2")
 
 # Kokoro imports for final validation
 from kokoro import KModel, KPipeline
@@ -203,28 +209,45 @@ class StyleToKokoroProjection(nn.Module):
 
 @contextmanager
 def allow_pickle():
+    """Temporarily allow full checkpoint unpickling (StyleTTS2 needs it)."""
     with torch.serialization.safe_globals([getattr]):
         yield
 
-def load_styletts2_model(device="cpu"):
-    """
-    Load StyleTTS2 model for style extraction.
-    
-    Returns:
-        StyleTTS2 model ready for inference
-    """
+def load_styletts2_model(device: str = "cpu"):
+    """Instantiate StyleTTS2 for inference & style extraction."""
     if not STYLETTS2_AVAILABLE:
-        raise ImportError("StyleTTS2 not available. Install with: pip install styletts2")
-    
+        raise ImportError("StyleTTS2 not installed. `pip install styletts2`. ")
+
     with allow_pickle():
-        try:
-            # Use the StyleTTS2 package API
-            model = tts.StyleTTS2()
-            print("✓ Loaded StyleTTS2 model using package API")
-            return model, "simple"
-        except Exception as e:
-            print(f"StyleTTS2 loading failed: {e}")
-            raise RuntimeError("Could not load StyleTTS2 model")
+        model = tts.StyleTTS2().to(device).eval()
+    print("✓ StyleTTS2 model loaded (pip package)")
+    return model  # no longer returning model_type
+
+def extract_style_from_audio(model, audio: torch.Tensor | np.ndarray, sr: int = 24000) -> torch.Tensor | None:
+    """Return the 256-D style vector for a single audio sample.
+
+    The pip package exposes `compute_style()` which accepts either a path or
+    a numpy array.  We avoid temporary files by passing the waveform array
+    directly.
+    """
+    try:
+        # Ensure numpy, correct sample-rate & mono
+        if isinstance(audio, torch.Tensor):
+            audio_np = audio.cpu().numpy()
+        else:
+            audio_np = audio
+
+        if audio_np.ndim > 1:
+            audio_np = audio_np.mean(0)
+
+        if sr != 24000:
+            audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=24000)
+
+        style_vec = model.compute_style(audio_np)  # returns np.ndarray (256,)
+        return torch.from_numpy(style_vec).float()
+    except Exception as exc:
+        print(f"Style extraction failed: {exc}")
+        return None
 
 def extract_styletts2_embeddings(
     dataset: StyleExtractionDataset,
@@ -251,12 +274,11 @@ def extract_styletts2_embeddings(
     print("="*60)
     
     # Load StyleTTS2 model
-    print("Loading StyleTTS2 model...")
+    print("Loading StyleTTS2 model…")
     try:
-        styletts2_model, model_type = load_styletts2_model(device)
+        styletts2_model = load_styletts2_model(device)
     except Exception as e:
-        print(f"Failed to load StyleTTS2 model: {e}")
-        print("Falling back to feature-based style extraction...")
+        print(f"StyleTTS2 unavailable → fallback to audio-feature extraction ({e})")
         return extract_audio_features_as_style(dataset, device, max_samples)
     
     embeddings = []
@@ -273,8 +295,8 @@ def extract_styletts2_embeddings(
         text, audio, wav_path = dataset[idx]
         
         try:
-            # Use StyleTTS2 package API
-            style_embedding = extract_style_simple_api(styletts2_model, audio, text, device)
+            # one-shot style extraction
+            style_embedding = extract_style_from_audio(styletts2_model, audio, sr=24000)
             
             if style_embedding is not None:
                 embeddings.append(style_embedding.cpu())
@@ -284,7 +306,7 @@ def extract_styletts2_embeddings(
             continue
     
     if not embeddings:
-        print("No StyleTTS2 embeddings extracted, falling back to audio features...")
+        print("No StyleTTS2 embeddings extracted → fallback to audio features…")
         return extract_audio_features_as_style(dataset, device, max_samples)
     
     # Average all embeddings
@@ -295,138 +317,6 @@ def extract_styletts2_embeddings(
     print(f"Embedding statistics: mean={avg_embedding.mean():.4f}, std={avg_embedding.std():.4f}")
     
     return avg_embedding, embeddings
-
-def extract_style_simple_api(model, audio: torch.Tensor, text: str, device: str) -> Optional[torch.Tensor]:
-    """
-    Extract style using StyleTTS2 package API.
-    """
-    try:
-        # Save audio temporarily
-        temp_audio_path = f"temp_audio_{random.randint(1000, 9999)}.wav"
-        torchaudio.save(temp_audio_path, audio.unsqueeze(0), 24000)
-        
-        # Use StyleTTS2 inference to extract style
-        # The ref_s parameter should return the style vector when set to None
-        try:
-            # Try to get style vector by running inference with target voice
-            result = model.inference(
-                text="Hello world",  # Simple text for style extraction
-                target_voice_path=temp_audio_path,
-                alpha=0.3,
-                beta=0.7,
-                diffusion_steps=5,
-                embedding_scale=1
-            )
-            
-            # The style vector might be stored in the model after inference
-            style_embedding = None
-            
-            # Try different ways to access the style vector
-            if hasattr(model, 'ref_s') and model.ref_s is not None:
-                style_embedding = model.ref_s
-            elif hasattr(model, 'style_vector'):
-                style_embedding = model.style_vector
-            elif hasattr(model, 'last_style'):
-                style_embedding = model.last_style
-            elif isinstance(result, dict) and 'style' in result:
-                style_embedding = result['style']
-            else:
-                # Try to extract from model internals
-                style_embedding = extract_style_from_model_internals(model, temp_audio_path, device)
-                
-        except Exception as e:
-            print(f"Inference-based extraction failed: {e}")
-            # Try alternative approach - direct style computation
-            style_embedding = extract_style_from_model_internals(model, temp_audio_path, device)
-        
-        # Clean up temp file
-        if os.path.exists(temp_audio_path):
-            os.remove(temp_audio_path)
-        
-        if style_embedding is not None:
-            if isinstance(style_embedding, np.ndarray):
-                style_embedding = torch.from_numpy(style_embedding)
-            
-            # Ensure it's a 1D tensor
-            if style_embedding.dim() > 1:
-                style_embedding = style_embedding.squeeze()
-            
-            # Ensure it has a reasonable size (typically 256 or 512 for style vectors)
-            if style_embedding.numel() > 0 and style_embedding.numel() <= 1024:
-                return style_embedding.float()
-        
-        return None
-        
-    except Exception as e:
-        print(f"Error in StyleTTS2 API extraction: {e}")
-        return None
-
-def extract_style_from_model_internals(model, audio_path: str, device: str) -> Optional[torch.Tensor]:
-    """
-    Try to extract style by accessing model internals during inference.
-    """
-    try:
-        # Load and preprocess audio
-        audio, sr = torchaudio.load(audio_path)
-        if sr != 24000:
-            audio = torchaudio.functional.resample(audio, sr, 24000)
-        
-        audio = audio.mean(0).to(device)  # Convert to mono
-        
-        # Hook to capture style embeddings
-        style_embeddings = []
-        
-        def style_hook(module, input, output):
-            if output is not None and isinstance(output, torch.Tensor):
-                if output.dim() >= 1 and output.shape[-1] in [256, 512, 1024]:
-                    style_embeddings.append(output.detach().clone())
-        
-        # Register hooks on potential style encoder modules
-        hooks = []
-        for name, module in model.named_modules():
-            if any(keyword in name.lower() for keyword in ['style', 'ref', 'encoder']):
-                hook = module.register_forward_hook(style_hook)
-                hooks.append(hook)
-        
-        # Run inference to trigger hooks
-        try:
-            # Try different inference methods
-            if hasattr(model, 'inference'):
-                model.inference("dummy text", reference_dps=audio_path)
-            elif hasattr(model, 'forward'):
-                # Prepare inputs for forward pass
-                mel_transform = torchaudio.transforms.MelSpectrogram(
-                    sample_rate=24000, n_fft=1024, hop_length=256, n_mels=80
-                ).to(device)
-                mel = mel_transform(audio.unsqueeze(0))
-                mel = torch.log(mel.clamp(min=1e-5))
-                
-                model.forward(mel)
-        except:
-            pass
-        
-        # Remove hooks
-        for hook in hooks:
-            hook.remove()
-        
-        # Return the most suitable style embedding
-        if style_embeddings:
-            # Prefer embeddings with common style dimensions
-            for emb in style_embeddings:
-                if emb.shape[-1] == 256:
-                    return emb.squeeze().float()
-            
-            # Fallback to first embedding
-            emb = style_embeddings[0]
-            if emb.dim() > 1:
-                emb = emb.mean(dim=0)
-            return emb.squeeze().float()
-        
-        return None
-        
-    except Exception as e:
-        print(f"Error extracting from model internals: {e}")
-        return None
 
 def extract_audio_features_as_style(
     dataset: StyleExtractionDataset, 
