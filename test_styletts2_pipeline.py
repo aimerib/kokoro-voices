@@ -17,6 +17,15 @@ try:
 except Exception:
     pass  # running on PyTorch<2.6 or already patched
 
+# Allow full pickle unpickling inside tests (StyleTTS2 checkpoints)
+import warnings as _warnings
+_orig_tload = torch.load
+def _allow_pickle_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _orig_tload(*args, **kwargs)
+_warnings.warn("⚠  test suite overrides torch.load to allow full pickle unpickling", RuntimeWarning)
+torch.load = _allow_pickle_load
 
 def test_audio_feature_extraction():
     """Test the audio feature extraction fallback."""
