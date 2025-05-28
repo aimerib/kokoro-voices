@@ -37,11 +37,14 @@ Examples:
   # Multiple sources
   kokoro-pipeline "https://youtube.com/..." ./more-audio/ --output my-voice
 
-  # Fast mode with upload
+  # Fast mode (skip heavy processing)
   kokoro-pipeline ./audio/ --output my-voice --enhancement-mode fast --upload-hf --hf-repo username/my-voice
 
   # High quality mode
   kokoro-pipeline ./audio/ --output my-voice --enhancement-mode quality --whisper-model large
+
+  # Auto mode (adaptive enhancement based on audio quality)
+  kokoro-pipeline ./audio/ --output my-voice --enhancement-mode auto
 
   # Resume from checkpoint
   kokoro-pipeline --resume --output my-voice
@@ -757,11 +760,14 @@ Examples:
   # Multiple sources
   kokoro-pipeline "https://youtube.com/..." ./more-audio/ --output my-voice
 
-  # Fast mode with upload
+  # Fast mode (skip heavy processing)
   kokoro-pipeline ./audio/ --output my-voice --enhancement-mode fast --upload-hf --hf-repo username/my-voice
 
   # High quality mode
   kokoro-pipeline ./audio/ --output my-voice --enhancement-mode quality --whisper-model large
+
+  # Auto mode (adaptive enhancement based on audio quality)
+  kokoro-pipeline ./audio/ --output my-voice --enhancement-mode auto
 
   # Resume from checkpoint
   kokoro-pipeline --resume --output my-voice
@@ -817,9 +823,9 @@ Examples:
     )
     models.add_argument(
         "--enhancement-mode",
-        choices=["fast", "balanced", "quality"],
+        choices=["fast", "balanced", "quality", "auto"],
         default="balanced",
-        help="Audio enhancement mode (default: balanced)",
+        help="Audio enhancement mode - auto: adaptive method selection based on audio quality analysis (default: balanced)",
     )
     models.add_argument(
         "--no-deepfilter",

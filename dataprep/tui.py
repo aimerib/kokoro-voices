@@ -164,7 +164,7 @@ This tool will guide you through:
         # Enhancement mode
         mode = Prompt.ask(
             "\nSelect enhancement mode",
-            choices=["fast", "balanced", "quality"],
+            choices=["fast", "balanced", "quality", "auto"],
             default="balanced",
         )
 
@@ -172,6 +172,7 @@ This tool will guide you through:
             "fast": "⚡ Fast: MetricGAN+ only (good for quick processing)",
             "balanced": "⚖️  Balanced: MetricGAN+ (recommended)",
             "quality": "💎 Quality: VoiceFixer (best quality, slower)",
+            "auto": "🤖 Auto: Adaptive method selection based on audio quality analysis",
         }
         self.console.print(mode_info[mode])
 
