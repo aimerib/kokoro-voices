@@ -2,7 +2,6 @@
 """Dataset cleaning module"""
 
 import json
-import logging
 from pathlib import Path
 from typing import Dict, List, Tuple
 from collections import defaultdict
@@ -35,6 +34,10 @@ class DatasetCleaner:
         """Clean dataset by removing low-quality samples"""
         self.logger.info("Cleaning dataset: %s", dataset_dir)
 
+        # Create rejected directory
+        rejected_dir = dataset_dir / "rejected"
+        rejected_dir.mkdir(exist_ok=True)
+
         quality_report = {
             "total_analyzed": 0,
             "total_kept": 0,
@@ -49,6 +52,10 @@ class DatasetCleaner:
             split_dir = dataset_dir / split
             if not split_dir.exists():
                 continue
+
+            # Create split-specific rejected directory
+            split_rejected_dir = rejected_dir / split
+            split_rejected_dir.mkdir(exist_ok=True)
 
             self.logger.info("Processing %s split", split)
 
@@ -86,18 +93,24 @@ class DatasetCleaner:
                     for issue in issues:
                         quality_report["rejection_reasons"][issue] += 1
 
-                    # Optionally remove bad files
-                    if self.logger.isEnabledFor(logging.DEBUG):
-                        self.logger.debug(
-                            "Rejected %s: %s", audio_path.name, ", ".join(
-                                issues)
-                        )
+                    # Move rejected file
+                    try:
+                        audio_path.rename(split_rejected_dir / audio_path.name)
+                    except Exception as e:
+                        self.logger.error(
+                            "Failed to move rejected file %s: %s", audio_path, str(e))
+                # Remove rejected folder
+                try:
+                    split_rejected_dir.rmdir()
+                except Exception as e:
+                    self.logger.error(
+                        "Failed to remove rejected folder %s: %s", split_rejected_dir, str(e))
 
-            # Save cleaned metadata
-            if kept_metadata:
-                with open(metadata_file, "w", encoding="utf-8") as f:
-                    for item in kept_metadata:
-                        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                # Save cleaned metadata
+                if kept_metadata:
+                    with open(metadata_file, "w", encoding="utf-8") as f:
+                        for item in kept_metadata:
+                            f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
                 self.logger.info(
                     "Kept %s/%s files in %s",

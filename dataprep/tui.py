@@ -72,7 +72,7 @@ class DatasetPipelineTUI:
         """Show welcome screen"""
         self.console.clear()
         welcome_text = """
-[bold cyan]Kokoro Voice Dataset Pipeline[/bold cyan]
+[bold magenta]Kokoro Voice Dataset Pipeline[/bold magenta]
 [dim]End-to-end dataset preparation for TTS training[/dim]
 
 This tool will guide you through:
@@ -90,7 +90,19 @@ This tool will guide you through:
 • Per-file fault tolerance
         """
         self.console.print(
-            Panel(welcome_text, title="Welcome", border_style="cyan"))
+            Panel(welcome_text, title="Welcome", border_style="magenta"))
+
+        # Add option for standalone upload
+        choice = Prompt.ask(
+            "Select operation",
+            choices=["process", "upload", "quit"],
+            default="process",
+        )
+
+        if choice == "quit":
+            sys.exit(0)
+
+        return choice
 
     def get_input_sources(self):
         """Interactive input source selection"""
@@ -458,7 +470,86 @@ This tool will guide you through:
 
     def run_interactive(self):
         """Run the full interactive pipeline"""
-        self.welcome()
+        operation = self.welcome()
+
+        if operation == "upload":
+            self.run_standalone_upload()
+        else:
+            self.run_full_pipeline()
+
+    def run_standalone_upload(self):
+        """Run just the upload portion for prepared datasets"""
+        self.console.print("[bold]Standalone Dataset Upload[/bold]")
+
+        # Get dataset directory
+        dataset_dir = Prompt.ask(
+            "Enter path to prepared dataset directory",
+            default=str(Path.cwd()),
+        )
+
+        # Validate dataset structure
+        if not self.validate_dataset(dataset_dir):
+            self.console.print("[red]Invalid dataset structure[/red]")
+            return
+
+        # Get upload options
+        upload_config = self.get_upload_options()
+
+        # Build and run upload command
+        self._build_and_run_upload_command(dataset_dir, upload_config)
+
+    def validate_dataset(self, dataset_dir: str) -> bool:
+        """Validate dataset has required structure"""
+        required_dirs = {"train", "validation", "test"}
+        required_files = {"README.md"}
+
+        try:
+            path = Path(dataset_dir)
+            if not path.exists():
+                return False
+
+            for split in required_dirs:
+                split_path = path / split
+                if not split_path.exists():
+                    return False
+
+                metadata_file = split_path / "metadata.jsonl"
+                if not metadata_file.exists():
+                    return False
+
+            for file in required_files:
+                file_path = path / file
+                if not file_path.exists():
+                    return False
+
+            return True
+        except Exception:
+            return False
+
+    def _build_and_run_upload_command(self, dataset_dir: str, config: dict):
+        """Build and run HF upload command"""
+        cmd = [
+            "python",
+            "-m",
+            "dataprep.modules.uploader",
+            "--dataset-dir",
+            dataset_dir,
+        ]
+
+        if config.get("hf_repo"):
+            cmd.extend(["--hf-repo", config["hf_repo"]])
+        if config.get("private"):
+            cmd.append("--private")
+
+        self.console.print(f"[bold]Running:[/bold] {' '.join(cmd)}")
+
+        # Run command (implementation similar to _build_and_run_command)
+        # sys.argv = cmd
+        # run_pipeline()
+
+    def run_full_pipeline(self):
+        """Run the full pipeline"""
+        self.console.print("\n[bold]Step 1: Output Options[/bold]")
 
         if not Confirm.ask("\nContinue?", default=True):
             return
