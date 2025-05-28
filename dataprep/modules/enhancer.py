@@ -122,9 +122,7 @@ class AudioEnhancer:
             try:
                 # Auto mode - analyze and select methods
                 audio = self._apply_deepfilter(audio, sr)
-                audio = self._apply_metricgan(audio, sr)
                 audio = self._apply_spectral_subtraction(audio, sr)
-                audio = self._apply_pitch_correction(audio, sr)
                 audio = self._apply_resemble_enhance(audio, sr)
                 # quality_metrics = self._analyze_audio_quality(audio, sr)
                 # selected_methods = self._select_enhancement_methods(
@@ -219,20 +217,20 @@ class AudioEnhancer:
 
         from resemble_enhance.enhancer.inference import enhance
         from utilities import get_device_info
+        from tqdm import tqdm
 
         device = get_device_info()
         device = "cpu" if device == "mps" else device
 
         processed = torch.zeros_like(audio)
-        chunk_sec = self.config.get("voicefixer_chunk_duration", 10)
+        chunk_sec = self.config.get("chunk_duration", 10)
         overlap_sec = 1.0
-        total_chunks = 0
 
-        for i, chunk in enumerate(
-            chunk_generator(audio, sr, chunk_sec=chunk_sec,
-                            overlap_sec=overlap_sec)
-        ):
-            self.logger.info("Processing VoiceFixer chunk %d", i + 1)
+        # Generate all chunks first to get the count
+        chunks = list(chunk_generator(
+            audio, sr, chunk_sec=chunk_sec, overlap_sec=overlap_sec))
+
+        for i, chunk in enumerate(tqdm(chunks[:len(chunks) // 4], desc="Resemble Enhance", unit="chunk")):
             # Convert to integers for slicing
             start = int(i * (chunk_sec - overlap_sec) * sr)
             end = int(start + chunk.shape[-1])
@@ -241,12 +239,11 @@ class AudioEnhancer:
             hwav, _ = enhance(dwav, sr, device=device, nfe=64)
 
             processed[..., start:end] = hwav[None]
-            total_chunks += 1
 
         self.logger.info(
-            "Completed VoiceFixer processing in %.2fs (%d chunks)",
+            "Completed Resemble Enhance processing in %.2fs (%d chunks)",
             time.time() - start_time,
-            total_chunks,
+            len(chunks),
         )
         return processed
 
