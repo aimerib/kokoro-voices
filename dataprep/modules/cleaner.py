@@ -139,6 +139,10 @@ class DatasetCleaner:
             # Load and prepare audio
             audio, sr = torchaudio.load(audio_path)
 
+            # Basic validation
+            if audio.numel() == 0:
+                return False, {"error": "empty_file"}, ["empty_file"]
+
             # Convert to mono if needed
             if audio.shape[0] > 1:
                 audio = audio.mean(dim=0, keepdim=True)
@@ -146,16 +150,16 @@ class DatasetCleaner:
             if audio.dim() > 1:
                 audio = audio.squeeze(0)
 
-            # Resample to 16kHz for Whisper
+            # Resample to 16kHz for consistent analysis
             if sr != 16000:
                 resampler = torchaudio.transforms.Resample(sr, 16000)
                 audio = resampler(audio)
+                sr = 16000
 
             # Convert to numpy
             audio_np = audio.numpy().astype('float32')
             if audio_np.ndim > 1:
                 audio_np = audio_np.flatten()
-
 
             # Calculate metrics
             metrics = {}
@@ -170,6 +174,10 @@ class DatasetCleaner:
             elif duration > self.max_duration:
                 issues.append(f"too_long_{duration:.1f}s")
 
+            # Skip spectral analysis for very short files
+            if duration < 0.05:  # 50ms minimum for analysis
+                return False, metrics, issues + ["too_short_for_analysis"]
+
             # Peak amplitude check
             peak = np.max(np.abs(audio_np))
             metrics["peak"] = peak
@@ -183,19 +191,21 @@ class DatasetCleaner:
             signal_power = np.mean(audio_np**2)
 
             # Estimate noise from quiet parts
-            frame_size = int(0.025 * sr)
+            frame_size = max(64, int(0.025 * sr))  # Minimum 64 samples
             frame_powers = []
-            for i in range(0, len(audio_np) - frame_size, frame_size):
-                frame = audio_np[i: i + frame_size]
-                frame_powers.append(np.mean(frame**2))
 
-            if frame_powers:
-                noise_power = np.percentile(frame_powers, 10) + 1e-10
-                snr_db = 10 * np.log10(signal_power / noise_power)
-                metrics["snr_db"] = snr_db
+            if len(audio_np) > frame_size:
+                for i in range(0, len(audio_np) - frame_size, frame_size):
+                    frame = audio_np[i:i + frame_size]
+                    frame_powers.append(np.mean(frame**2))
 
-                if snr_db < self.min_snr_db:
-                    issues.append(f"low_snr_{snr_db:.1f}dB")
+                if frame_powers:
+                    noise_power = np.percentile(frame_powers, 10) + 1e-10
+                    snr_db = 10 * np.log10(signal_power / noise_power)
+                    metrics["snr_db"] = snr_db
+
+                    if snr_db < self.min_snr_db:
+                        issues.append(f"low_snr_{snr_db:.1f}dB")
 
             # DC offset check
             dc_offset = np.mean(audio_np)
@@ -204,23 +214,33 @@ class DatasetCleaner:
             if abs(dc_offset) > 0.05:
                 issues.append("dc_offset")
 
-            # Low frequency rumble check
-            f, psd = scipy.signal.welch(
-                audio_np, sr, nperseg=min(1024, len(audio_np) // 4)
-            )
-            low_freq_mask = f < 80
-            if np.any(low_freq_mask):
-                low_freq_ratio = np.sum(
-                    psd[low_freq_mask]) / (np.sum(psd) + 1e-10)
-                metrics["low_freq_ratio"] = low_freq_ratio
+            # Low frequency rumble check (only if long enough)
+            if len(audio_np) >= 512:  # Minimum samples for Welch
+                try:
+                    f, psd = scipy.signal.welch(
+                        audio_np,
+                        sr,
+                        nperseg=min(1024, len(audio_np) // 4)
+                    )
+                    low_freq_mask = f < 80
+                    if np.any(low_freq_mask):
+                        low_freq_ratio = np.sum(
+                            psd[low_freq_mask]) / (np.sum(psd) + 1e-10)
+                        metrics["low_freq_ratio"] = low_freq_ratio
 
-                if low_freq_ratio > 0.1:
-                    issues.append("low_freq_rumble")
+                        if low_freq_ratio > 0.1:
+                            issues.append("low_freq_rumble")
+                except ValueError as e:
+                    self.logger.warning(
+                        "Spectral analysis failed for %s: %s", audio_path.name, str(e))
+                    issues.append("spectral_analysis_failed")
 
             # Calculate overall quality score
             quality_score = 1.0
-            quality_score *= min(1.0, metrics.get("snr_db", 20) / 20)
-            quality_score *= 1.0 - metrics.get("low_freq_ratio", 0)
+            if "snr_db" in metrics:
+                quality_score *= min(1.0, metrics["snr_db"] / 20)
+            if "low_freq_ratio" in metrics:
+                quality_score *= 1.0 - metrics["low_freq_ratio"]
             quality_score *= (
                 min(1.0, peak / 0.5) if peak < 0.5 else (1.0 - (peak - 0.5) / 0.5)
             )
@@ -232,6 +252,7 @@ class DatasetCleaner:
 
             return is_good, metrics, issues
 
-        except Exception as e:  # pylint: disable=broad-except
-            self.logger.error("Error analyzing %s: %s", audio_path, e)
-            return False, {}, [f"analysis_error_{str(e)}"]
+        except Exception as e:
+            self.logger.error("Error analyzing %s: %s",
+                              audio_path.name, str(e), exc_info=True)
+            return False, {"error": str(e)}, ["analysis_error"]
