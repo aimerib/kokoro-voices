@@ -430,13 +430,13 @@ class VoiceEmbedding:
 
         # Target statistics for normalization
         self.timbre_mean = 0.0
-        self.timbre_std = 0.25
+        self.timbre_std = 0.14
         self.style_mean = 0.0
-        self.style_std = 0.25
+        self.style_std = 0.14
 
         # Health parameters
-        self.target_std = 0.30
-        self.max_std = 0.35
+        self.target_std = 0.14
+        self.max_std = 0.2
 
     @property
     def base_voice(self):
