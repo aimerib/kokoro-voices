@@ -281,10 +281,18 @@ def extract_style_from_audio(model, audio: torch.Tensor | np.ndarray, sr: int = 
             sf.write(tmp.name, audio_np, 24000)
             tmp_path = tmp.name
 
-        style_vec = model.compute_style(tmp_path)  # returns np.ndarray
+        style_vec = model.compute_style(tmp_path)
 
         os.remove(tmp_path)
-        return torch.from_numpy(style_vec).float()
+
+        if isinstance(style_vec, np.ndarray):
+            vec = torch.from_numpy(style_vec)
+        elif isinstance(style_vec, torch.Tensor):
+            vec = style_vec
+        else:
+            vec = torch.tensor(style_vec)
+
+        return vec.float().squeeze()
     except Exception as exc:
         print(f"Style extraction failed: {exc}")
         return None
