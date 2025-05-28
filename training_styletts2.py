@@ -1015,7 +1015,8 @@ def generate_audio_samples_for_logging(
     
     audio_samples = []
     
-    # Ensure embedding has right format for Kokoro
+    # Ensure embedding is on the correct device and has right format for Kokoro
+    kokoro_embedding = kokoro_embedding.to(device)
     if kokoro_embedding.dim() == 1:
         kokoro_embedding = kokoro_embedding.unsqueeze(0)
     
@@ -1035,7 +1036,7 @@ def generate_audio_samples_for_logging(
             if not phonemes or len(phonemes) == 0:
                 continue
             
-            # Convert to input IDs
+            # Convert to input IDs and ensure they're on the correct device
             ids = [0]  # BOS
             ids.extend(kokoro_model.vocab.get(p) for p in phonemes if kokoro_model.vocab.get(p) is not None)
             ids.append(0)  # EOS
@@ -1044,12 +1045,20 @@ def generate_audio_samples_for_logging(
             if input_ids.shape[1] < 3:
                 continue
             
-            # Generate audio
+            # Generate audio - ensure embedding is on the same device as the model
             with torch.no_grad():
+                # Move kokoro_embedding to the same device as the model if needed
+                model_device = next(kokoro_model.parameters()).device
+                kokoro_embedding_for_gen = kokoro_embedding.to(model_device)
+                input_ids_for_gen = input_ids.to(model_device)
+                
                 generated_audio, _ = kokoro_model.forward_with_tokens(
-                    input_ids, 
-                    kokoro_embedding
+                    input_ids_for_gen, 
+                    kokoro_embedding_for_gen
                 )
+            
+            # Move generated audio back to CPU for logging
+            generated_audio = generated_audio.cpu()
             
             # Trim to reasonable length (max 5 seconds)
             max_samples = 24000 * 5
