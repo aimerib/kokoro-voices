@@ -266,9 +266,9 @@ def extract_style_from_audio(model, audio: torch.Tensor | np.ndarray, sr: int = 
     try:
         # Ensure numpy mono 24 kHz
         if isinstance(audio, torch.Tensor):
-            audio_np = audio.cpu().numpy()
+            audio_np = audio.detach().cpu().numpy()
         else:
-            audio_np = audio
+            audio_np = np.asarray(audio)
 
         if audio_np.ndim > 1:
             audio_np = audio_np.mean(0)
@@ -285,12 +285,14 @@ def extract_style_from_audio(model, audio: torch.Tensor | np.ndarray, sr: int = 
 
         os.remove(tmp_path)
 
+        # Handle different return types from compute_style - ensure tensor output
         if isinstance(style_vec, np.ndarray):
             vec = torch.from_numpy(style_vec)
         elif isinstance(style_vec, torch.Tensor):
-            vec = style_vec
+            vec = style_vec.detach().cpu()
         else:
-            vec = torch.tensor(style_vec)
+            # Handle any other types by converting to tensor
+            vec = torch.tensor(style_vec, dtype=torch.float32)
 
         return vec.float().squeeze()
     except Exception as exc:
@@ -687,6 +689,15 @@ def train_kokoro_projection(
     
     best_loss = float('inf')
     
+    # Log initial embeddings to W&B if available
+    if logger and logger.use_wandb and WANDB_AVAILABLE:
+        # Log StyleTTS2 embedding
+        styletts2_embedding_np = style_embeddings.cpu().numpy()
+        wandb.log({
+            "styletts2_embedding": wandb.Histogram(styletts2_embedding_np),
+            "styletts2_embedding_pca": wandb.Image(visualize_embedding(styletts2_embedding_np))
+        })
+    
     for epoch in range(1, epochs + 1):
         projection.train()
         epoch_loss = 0.0
@@ -694,6 +705,9 @@ def train_kokoro_projection(
         
         # Sample a few target samples for this epoch
         epoch_samples = random.sample(target_samples, min(5, len(target_samples)))
+        
+        batch_losses = []
+        batch_mse_losses = []
         
         for text, target_audio in epoch_samples:
             try:
@@ -745,6 +759,9 @@ def train_kokoro_projection(
                 epoch_loss += loss.item()
                 valid_batches += 1
                 
+                batch_losses.append(loss.item())
+                batch_mse_losses.append(F.mse_loss(generated_mel, target_mel).item())
+                
             except Exception as e:
                 print(f"Warning: Batch failed: {e}")
                 continue
@@ -756,13 +773,48 @@ def train_kokoro_projection(
             if epoch % 10 == 0:
                 print(f"Epoch {epoch}/{epochs}: Loss = {avg_loss:.4f}")
             
+            # Project the StyleTTS2 embedding to visualize training progress
+            with torch.no_grad():
+                current_kokoro_embedding = projection(style_embeddings.to(device)).cpu()
+            
+            # Calculate gradient norm for monitoring training stability
+            grad_norm = 0.0
+            param_norm = 0.0
+            for p in projection.parameters():
+                if p.grad is not None:
+                    grad_norm += p.grad.norm(2).item() ** 2
+                param_norm += p.norm(2).item() ** 2
+            grad_norm = grad_norm ** 0.5
+            param_norm = param_norm ** 0.5
+            
             # Log metrics
+            metrics = {
+                'projection_loss': avg_loss,
+                'projection_lr': optimizer.param_groups[0]['lr'],
+                'epoch': epoch,
+                'grad_norm': grad_norm,
+                'param_norm': param_norm,
+                'embedding_norm': torch.norm(current_kokoro_embedding).item(),
+                'batch_loss_std': np.std(batch_losses) if batch_losses else 0,
+                'batch_mse_std': np.std(batch_mse_losses) if batch_mse_losses else 0
+            }
+            
             if logger:
-                logger.log_metrics({
-                    'projection_loss': avg_loss,
-                    'projection_lr': optimizer.param_groups[0]['lr'],
-                    'epoch': epoch
-                })
+                logger.log_metrics(metrics)
+                
+                # Additional W&B-specific logging
+                if logger.use_wandb and WANDB_AVAILABLE and epoch % 10 == 0:
+                    # Log the embedding distribution
+                    kokoro_embedding_np = current_kokoro_embedding.numpy()
+                    
+                    # Log histograms of embedding values
+                    wandb.log({
+                        "kokoro_embedding": wandb.Histogram(kokoro_embedding_np),
+                        "kokoro_embedding_pca": wandb.Image(visualize_embedding(kokoro_embedding_np)),
+                        "projection_weights": wandb.Histogram(
+                            projection.projection[-2].weight.data.cpu().numpy()
+                        )
+                    })
             
             # Save best model
             if avg_loss < best_loss:
@@ -772,6 +824,44 @@ def train_kokoro_projection(
     
     print(f"Projection training completed. Best loss: {best_loss:.4f}")
     return projection
+
+def visualize_embedding(embedding_np):
+    """Create a PCA visualization of an embedding vector for W&B visualization."""
+    try:
+        import numpy as np
+        from sklearn.decomposition import PCA
+        import matplotlib.pyplot as plt
+        
+        # Reshape if needed to ensure 2D array with samples as rows
+        if embedding_np.ndim == 1:
+            data = embedding_np.reshape(1, -1)
+        else:
+            data = embedding_np
+            
+        # Apply PCA to reduce to 2 dimensions
+        pca = PCA(n_components=2)
+        reduced_data = pca.fit_transform(data)
+        
+        # Create a scatter plot
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.scatter(reduced_data[:, 0], reduced_data[:, 1], alpha=0.7)
+        
+        # Add explained variance as title
+        explained_variance = pca.explained_variance_ratio_
+        ax.set_title(f'PCA of Embedding (Explained variance: {explained_variance[0]:.2f}, {explained_variance[1]:.2f})')
+        
+        ax.set_xlabel('Principal Component 1')
+        ax.set_ylabel('Principal Component 2')
+        ax.grid(True)
+        
+        return fig
+    except Exception as e:
+        print(f"Error visualizing embedding: {e}")
+        # Return a blank figure if visualization fails
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.text(0.5, 0.5, f"Visualization error: {e}", 
+                horizontalalignment='center', verticalalignment='center')
+        return fig
 
 # ---------------------------------------------------------------------------
 # Main Training Pipeline
@@ -830,6 +920,26 @@ def train_styletts2_to_kokoro(
     log_dir = os.path.join('runs', Path(out).stem) if use_tensorboard else None
     run_name = wandb_name or f"{name}_{time.strftime('%Y%m%d_%H%M%S')}"
     
+    # Initialize W&B with more config details
+    if use_wandb and WANDB_AVAILABLE:
+        wandb_config = {
+            "dataset": str(data_root),
+            "name": name,
+            "epochs_projection": epochs_projection,
+            "lr_projection": lr_projection,
+            "max_style_samples": max_style_samples,
+            "device": device,
+            "styletts2_available": STYLETTS2_AVAILABLE,
+            "pipeline_version": "1.0",
+            "datetime": datetime.datetime.now().isoformat()
+        }
+        if not wandb.run:
+            wandb.init(
+                project=wandb_project or "styletts2-kokoro-pipeline",
+                name=run_name,
+                config=wandb_config
+            )
+    
     logger = TrainingLogger(
         use_tensorboard=use_tensorboard,
         use_wandb=use_wandb,
@@ -865,6 +975,40 @@ def train_styletts2_to_kokoro(
             device=device,
             max_samples=max_style_samples
         )
+        
+        # Log embedding stats to W&B
+        if use_wandb and WANDB_AVAILABLE:
+            embedding_stats = {
+                "styletts2_embedding_mean": avg_style_embedding.mean().item(),
+                "styletts2_embedding_std": avg_style_embedding.std().item(),
+                "styletts2_embedding_min": avg_style_embedding.min().item(),
+                "styletts2_embedding_max": avg_style_embedding.max().item(),
+                "styletts2_embedding_l2norm": torch.norm(avg_style_embedding).item(),
+                "num_embeddings_extracted": len(all_embeddings)
+            }
+            wandb.log(embedding_stats)
+            
+            # Create embedding visualization
+            if len(all_embeddings) > 1:
+                all_emb_stacked = torch.stack(all_embeddings).cpu().numpy()
+                wandb.log({"all_styletts2_embeddings": wandb.Histogram(all_emb_stacked)})
+                
+                # PCA visualization of embeddings
+                try:
+                    from sklearn.decomposition import PCA
+                    pca = PCA(n_components=2)
+                    pca_result = pca.fit_transform(all_emb_stacked)
+                    
+                    plt.figure(figsize=(10, 8))
+                    plt.scatter(pca_result[:, 0], pca_result[:, 1], alpha=0.6)
+                    plt.title('PCA of StyleTTS2 Embeddings')
+                    plt.xlabel('PC1')
+                    plt.ylabel('PC2')
+                    plt.grid(True)
+                    wandb.log({"styletts2_embeddings_pca": wandb.Image(plt)})
+                    plt.close()
+                except Exception as e:
+                    print(f"Error creating PCA visualization: {e}")
         
         # Prepare target samples for projection training
         target_samples = []
@@ -905,6 +1049,17 @@ def train_styletts2_to_kokoro(
         torch.save(kokoro_voice_tensor, voice_path)
         print(f"✓ Saved Kokoro voice embedding: {voice_path}")
         
+        # Log final embedding to W&B
+        if use_wandb and WANDB_AVAILABLE:
+            final_embedding_stats = {
+                "kokoro_embedding_mean": final_kokoro_embedding.mean().item(),
+                "kokoro_embedding_std": final_kokoro_embedding.std().item(),
+                "kokoro_embedding_min": final_kokoro_embedding.min().item(),
+                "kokoro_embedding_max": final_kokoro_embedding.max().item(),
+                "kokoro_embedding_l2norm": torch.norm(final_kokoro_embedding).item()
+            }
+            wandb.log(final_embedding_stats)
+        
         # Save additional artifacts
         artifacts = {
             'styletts2_embeddings': avg_style_embedding.cpu(),
@@ -925,7 +1080,22 @@ def train_styletts2_to_kokoro(
         
         # Test generation with Kokoro
         print("\nTesting voice with Kokoro TTS...")
-        test_voice_generation(kokoro_voice_tensor, output_dir, name)
+        test_sentences, test_audio_paths = test_voice_generation(kokoro_voice_tensor, output_dir, name)
+        
+        # Log test generations to W&B
+        if use_wandb and WANDB_AVAILABLE and test_audio_paths:
+            for i, (text, audio_path) in enumerate(zip(test_sentences, test_audio_paths)):
+                try:
+                    audio, sr = librosa.load(audio_path, sr=24000)
+                    wandb.log({
+                        f"test_audio_{i+1}": wandb.Audio(
+                            audio, 
+                            sample_rate=sr,
+                            caption=f"Test {i+1}: {text[:30]}..."
+                        )
+                    })
+                except Exception as e:
+                    print(f"Error logging test audio to W&B: {e}")
         
         total_time = time.time() - training_start_time
         print(f"\n{'='*60}")
@@ -934,28 +1104,40 @@ def train_styletts2_to_kokoro(
         print(f"Final voice: {voice_path}")
         print(f"{'='*60}\n")
         
+        # Final W&B summary
+        if use_wandb and WANDB_AVAILABLE:
+            wandb.run.summary["total_time_seconds"] = total_time
+            wandb.run.summary["voice_path"] = str(voice_path)
+            wandb.run.summary["success"] = True
+        
     except Exception as e:
         print(f"\nPipeline failed: {e}")
+        if use_wandb and WANDB_AVAILABLE:
+            wandb.run.summary["error"] = str(e)
+            wandb.run.summary["success"] = False
         raise
     finally:
+        if use_wandb and WANDB_AVAILABLE:
+            wandb.finish()
         logger.close()
 
 def test_voice_generation(voice_tensor: torch.Tensor, output_dir: Path, name: str):
     """Test the generated voice with sample text"""
+    test_sentences = [
+        "Hello, this is a test of the new voice.",
+        "The quick brown fox jumps over the lazy dog.",
+        "How are you doing today?"
+    ]
+    
+    test_audio_paths = []
+    
     try:
         from kokoro import KPipeline
         
         # Initialize pipeline
         pipeline = KPipeline(lang_code="a")
         
-        # Test texts
-        test_texts = [
-            "Hello, this is a test of the new voice.",
-            "The quick brown fox jumps over the lazy dog.",
-            "How are you doing today?"
-        ]
-        
-        for i, text in enumerate(test_texts):
+        for i, text in enumerate(test_sentences):
             try:
                 # Generate audio
                 outputs = []
@@ -968,12 +1150,15 @@ def test_voice_generation(voice_tensor: torch.Tensor, output_dir: Path, name: st
                     
                     sf.write(output_path, full_audio.numpy(), 24000)
                     print(f"✓ Generated test audio: {output_path}")
+                    test_audio_paths.append(output_path)
                 
             except Exception as e:
                 print(f"Warning: Test generation {i+1} failed: {e}")
                 
     except Exception as e:
         print(f"Warning: Voice testing failed: {e}")
+        
+    return test_sentences, test_audio_paths
 
 # ---------------------------------------------------------------------------
 # Entry Point
