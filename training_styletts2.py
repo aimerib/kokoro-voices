@@ -494,51 +494,77 @@ def extract_comprehensive_audio_features(audio: torch.Tensor, device: str) -> Op
         mel_std = mel_log.std(dim=-1).squeeze()    # [80]
         
         # 2. MFCC features
-        mfcc_transform = torchaudio.transforms.MFCC(
-            sample_rate=24000,
-            n_mfcc=13,
-            melkwargs={
-                "n_fft": 1024,
-                "hop_length": 256,
-                "n_mels": 80,
-                "center": True,
-            }
-        ).to(device)
-        
-        mfcc = mfcc_transform(audio.unsqueeze(0))
-        mfcc_mean = mfcc.mean(dim=-1).squeeze()  # [13]
-        mfcc_std = mfcc.std(dim=-1).squeeze()    # [13]
+        try:
+            mfcc_transform = torchaudio.transforms.MFCC(
+                sample_rate=24000,
+                n_mfcc=13,
+                melkwargs={
+                    "n_fft": 1024,
+                    "hop_length": 256,
+                    "n_mels": 80,
+                    "center": True,
+                }
+            ).to(device)
+            
+            mfcc = mfcc_transform(audio.unsqueeze(0))
+            mfcc_mean = mfcc.mean(dim=-1).squeeze()  # [13]
+            mfcc_std = mfcc.std(dim=-1).squeeze()    # [13]
+        except Exception as e:
+            print(f"MFCC extraction failed: {e}")
+            mfcc_mean = torch.zeros(13, device=device)
+            mfcc_std = torch.zeros(13, device=device)
         
         # 3. Spectral features
-        spectral_centroid = torchaudio.functional.spectral_centroid(
-            audio.unsqueeze(0), sample_rate=24000, n_fft=1024, hop_length=256
-        ).mean()
+        try:
+            spectral_centroid = torchaudio.functional.spectral_centroid(
+                audio.unsqueeze(0), 
+                sample_rate=24000, 
+                pad=0,
+                window=torch.hann_window(1024, device=device),
+                n_fft=1024, 
+                hop_length=256,
+                win_length=1024
+            ).mean()
+        except Exception as e:
+            print(f"Spectral centroid extraction failed: {e}")
+            spectral_centroid = torch.tensor(0.0, device=device)
         
         # 4. Pitch features (F0)
         try:
             # Simple pitch estimation using autocorrelation
             pitch_features = estimate_pitch_features(audio, 24000)
-        except:
+        except Exception as e:
+            print(f"Pitch extraction failed: {e}")
             pitch_features = torch.zeros(4)  # Fallback
         
         # 5. Energy features
-        energy = torch.sqrt(torch.mean(audio ** 2))
-        zero_crossing_rate = torch.mean(
-            torch.abs(torch.diff(torch.sign(audio))) / 2.0
-        )
+        try:
+            energy = torch.sqrt(torch.mean(audio ** 2))
+            zero_crossing_rate = torch.mean(
+                torch.abs(torch.diff(torch.sign(audio))) / 2.0
+            )
+        except Exception as e:
+            print(f"Energy extraction failed: {e}")
+            energy = torch.tensor(0.0, device=device)
+            zero_crossing_rate = torch.tensor(0.0, device=device)
         
         # 6. Temporal features
         audio_length = len(audio) / 24000  # Duration in seconds
         
-        # Combine all features
-        features = torch.cat([
-            mel_mean[:64],      # 64 dims - mel mean (truncated)
-            mel_std[:64],       # 64 dims - mel std (truncated)
-            mfcc_mean,          # 13 dims - mfcc mean
-            mfcc_std,           # 13 dims - mfcc std
-            pitch_features,     # 4 dims - pitch statistics
-            torch.tensor([spectral_centroid, energy, zero_crossing_rate, audio_length], device=device)  # 4 dims
-        ])
+        # Combine all features with error handling
+        try:
+            features = torch.cat([
+                mel_mean[:64],      # 64 dims - mel mean (truncated)
+                mel_std[:64],       # 64 dims - mel std (truncated)
+                mfcc_mean,          # 13 dims - mfcc mean
+                mfcc_std,           # 13 dims - mfcc std
+                pitch_features,     # 4 dims - pitch statistics
+                torch.tensor([spectral_centroid, energy, zero_crossing_rate, audio_length], device=device)  # 4 dims
+            ])
+        except Exception as e:
+            print(f"Feature concatenation failed: {e}")
+            # Create a basic feature vector as fallback
+            features = torch.randn(256, device=device) * 0.1
         
         # Pad or truncate to exactly 256 dimensions
         if features.shape[0] > 256:
@@ -569,24 +595,42 @@ def estimate_pitch_features(audio: torch.Tensor, sample_rate: int) -> torch.Tens
         frame_length = 1024
         hop_length = 256
         
+        # Ensure audio is long enough
+        if len(audio) < frame_length:
+            return torch.zeros(4)
+        
         frames = audio.unfold(0, frame_length, hop_length)
         
         pitch_values = []
         for frame in frames:
-            # Autocorrelation
-            autocorr = torch.correlate(frame, frame, mode='full')
-            autocorr = autocorr[len(autocorr)//2:]
-            
-            # Find peak (excluding zero lag)
-            min_period = int(sample_rate / 500)  # 500 Hz max
-            max_period = int(sample_rate / 50)   # 50 Hz min
-            
-            if len(autocorr) > max_period:
-                search_range = autocorr[min_period:max_period]
-                if len(search_range) > 0:
-                    peak_idx = torch.argmax(search_range) + min_period
-                    pitch = sample_rate / peak_idx
-                    pitch_values.append(pitch)
+            try:
+                # Autocorrelation using conv1d (more stable than correlate)
+                frame_normalized = frame - frame.mean()
+                frame_normalized = frame_normalized / (frame_normalized.std() + 1e-8)
+                
+                # Pad for full correlation
+                padded = torch.nn.functional.pad(frame_normalized, (frame_length-1, 0))
+                autocorr = torch.nn.functional.conv1d(
+                    padded.unsqueeze(0).unsqueeze(0),
+                    frame_normalized.flip(0).unsqueeze(0).unsqueeze(0)
+                ).squeeze()
+                
+                # Take the second half (positive lags)
+                autocorr = autocorr[frame_length-1:]
+                
+                # Find peak (excluding zero lag)
+                min_period = int(sample_rate / 500)  # 500 Hz max
+                max_period = int(sample_rate / 50)   # 50 Hz min
+                
+                if len(autocorr) > max_period and max_period > min_period:
+                    search_range = autocorr[min_period:max_period]
+                    if len(search_range) > 0:
+                        peak_idx = torch.argmax(search_range) + min_period
+                        pitch = sample_rate / peak_idx.float()
+                        if 50 <= pitch <= 500:  # Reasonable pitch range
+                            pitch_values.append(pitch.item())
+            except Exception:
+                continue
         
         if pitch_values:
             pitch_tensor = torch.tensor(pitch_values)
