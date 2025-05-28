@@ -106,13 +106,6 @@ class DatasetCleaner:
                         for item in kept_metadata:
                             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-                # Remove rejected folder
-                try:
-                    rejected_dir.rmdir()
-                except Exception as e:
-                    self.logger.error(
-                        "Failed to remove rejected folder %s: %s", rejected_dir, str(e))
-
                 self.logger.info(
                     "Kept %s/%s files in %s",
                     len(kept_metadata),
@@ -139,6 +132,15 @@ class DatasetCleaner:
         self.logger.info("  Rejected: %s", quality_report["total_rejected"])
         self.logger.info("  Average quality: %.2f",
                          quality_report["average_quality"])
+
+        # Empty and remove rejected folder
+        try:
+            for file in rejected_dir.iterdir():
+                file.unlink()
+            rejected_dir.rmdir()
+        except Exception as e:
+            self.logger.error(
+                "Failed to remove rejected folder %s: %s", rejected_dir, str(e))
 
         if quality_report["rejection_reasons"]:
             self.logger.info("\nRejection reasons:")
