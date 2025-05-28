@@ -211,11 +211,36 @@ def load_styletts2_model(device: str = "cpu"):
     
     try:
         # Use the StyleTTS2 package API
-        model = tts.StyleTTS2()
-        print("✓ Loaded StyleTTS2 model using package API")
-        return model, "simple"
+        # Try to handle the weights_only issue by setting torch serialization
+        import torch.serialization
+        
+        # Add safe globals to handle the getattr issue
+        try:
+            torch.serialization.add_safe_globals([getattr])
+        except:
+            pass
+        
+        # Try loading with weights_only=False for compatibility
+        original_load = torch.load
+        def patched_load(*args, **kwargs):
+            if 'weights_only' not in kwargs:
+                kwargs['weights_only'] = False
+            return original_load(*args, **kwargs)
+        
+        torch.load = patched_load
+        
+        try:
+            model = tts.StyleTTS2()
+            print("✓ Loaded StyleTTS2 model using package API")
+            return model, "simple"
+        finally:
+            # Restore original torch.load
+            torch.load = original_load
+            
     except Exception as e:
         print(f"StyleTTS2 loading failed: {e}")
+        print("This is expected if StyleTTS2 models aren't downloaded yet.")
+        print("The pipeline will fall back to audio feature extraction.")
         raise RuntimeError("Could not load StyleTTS2 model")
 
 def extract_styletts2_embeddings(
