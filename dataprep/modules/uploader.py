@@ -4,7 +4,9 @@
 from pathlib import Path
 from typing import Dict, Optional
 from huggingface_hub import HfApi, upload_folder
-
+import logging
+import shutil
+import tempfile
 from utilities import get_module_logger
 
 
@@ -14,6 +16,7 @@ class HuggingFaceUploader:
     def __init__(self):
         self.logger = get_module_logger(__name__)
         self.api = HfApi()
+        self.logger.setLevel(logging.DEBUG)
 
     def upload(
         self,
@@ -46,16 +49,16 @@ class HuggingFaceUploader:
         try:
             self.logger.info("Uploading files...")
             # copy only splits and readme to a os tmp folder for upload
-            # temp_dir = Path(tempfile.gettempdir()) / "kokoro-dataset"
-            # temp_dir.mkdir(exist_ok=True)
-            # for split in ["train", "validation", "test"]:
-            #     shutil.copytree(dataset_dir / split, temp_dir / split)
-            # shutil.copy(dataset_dir / "README.md", temp_dir)
+            temp_dir = Path(tempfile.gettempdir()) / "kokoro-dataset"
+            temp_dir.mkdir(exist_ok=True)
+            for split in ["train", "validation", "test"]:
+                shutil.copytree(dataset_dir / split, temp_dir / split)
+            shutil.copy(dataset_dir / "README.md", temp_dir)
 
             upload_folder(
                 repo_id=repo_id,
                 repo_type="dataset",
-                folder_path=str(dataset_dir),
+                folder_path=str(temp_dir),
                 commit_message="Add Kokoro voice dataset",
                 ignore_patterns=["*.pyc", "__pycache__", ".DS_Store", "*.log", ".temp"],
             )
@@ -63,7 +66,7 @@ class HuggingFaceUploader:
                 "✅ Upload complete: https://huggingface.co/datasets/%s",
                 repo_id,
             )
-            # shutil.rmtree(temp_dir)
+            shutil.rmtree(temp_dir)
 
         except Exception as e:
             self.logger.error("Error uploading dataset: %s", e)
