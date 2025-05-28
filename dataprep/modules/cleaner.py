@@ -15,7 +15,6 @@ import scipy.signal
 from utilities import get_module_logger
 
 
-
 class DatasetCleaner:
     """Clean and validate dataset quality"""
 
@@ -72,14 +71,16 @@ class DatasetCleaner:
                     continue
 
                 # Analyze quality
-                is_good, metrics, issues = self._analyze_audio_quality(audio_path)
+                is_good, metrics, issues = self._analyze_audio_quality(
+                    audio_path)
 
                 quality_report["total_analyzed"] += 1
 
                 if is_good:
                     kept_metadata.append(item)
                     quality_report["total_kept"] += 1
-                    quality_report["quality_metrics"].append(metrics["overall_score"])
+                    quality_report["quality_metrics"].append(
+                        metrics["overall_score"])
                 else:
                     quality_report["total_rejected"] += 1
                     for issue in issues:
@@ -88,7 +89,8 @@ class DatasetCleaner:
                     # Optionally remove bad files
                     if self.logger.isEnabledFor(logging.DEBUG):
                         self.logger.debug(
-                            "Rejected %s: %s", audio_path.name, ", ".join(issues)
+                            "Rejected %s: %s", audio_path.name, ", ".join(
+                                issues)
                         )
 
             # Save cleaned metadata
@@ -112,14 +114,17 @@ class DatasetCleaner:
 
         # Generate summary
         self.logger.info("\nCleaning Summary:")
-        self.logger.info("  Total analyzed: %s", quality_report["total_analyzed"])
+        self.logger.info("  Total analyzed: %s",
+                         quality_report["total_analyzed"])
         self.logger.info(
             "  Kept: %s (%.1f%%)",
             quality_report["total_kept"],
-            quality_report["total_kept"] / max(1, quality_report["total_analyzed"]) * 100,
+            quality_report["total_kept"] /
+            max(1, quality_report["total_analyzed"]) * 100,
         )
         self.logger.info("  Rejected: %s", quality_report["total_rejected"])
-        self.logger.info("  Average quality: %.2f", quality_report["average_quality"])
+        self.logger.info("  Average quality: %.2f",
+                         quality_report["average_quality"])
 
         if quality_report["rejection_reasons"]:
             self.logger.info("\nRejection reasons:")
@@ -131,12 +136,26 @@ class DatasetCleaner:
     def _analyze_audio_quality(self, audio_path: Path) -> Tuple[bool, Dict, List[str]]:
         """Analyze audio quality and determine if it meets standards"""
         try:
-            # Load audio
+            # Load and prepare audio
             audio, sr = torchaudio.load(audio_path)
-            if audio.shape[0] > 1:
-                audio = audio.mean(dim=0)
 
-            audio_np = audio.numpy()
+            # Convert to mono if needed
+            if audio.shape[0] > 1:
+                audio = audio.mean(dim=0, keepdim=True)
+
+            if audio.dim() > 1:
+                audio = audio.squeeze(0)
+
+            # Resample to 16kHz for Whisper
+            if sr != 16000:
+                resampler = torchaudio.transforms.Resample(sr, 16000)
+                audio = resampler(audio)
+
+            # Convert to numpy
+            audio_np = audio.numpy().astype('float32')
+            if audio_np.ndim > 1:
+                audio_np = audio_np.flatten()
+
 
             # Calculate metrics
             metrics = {}
@@ -167,7 +186,7 @@ class DatasetCleaner:
             frame_size = int(0.025 * sr)
             frame_powers = []
             for i in range(0, len(audio_np) - frame_size, frame_size):
-                frame = audio_np[i : i + frame_size]
+                frame = audio_np[i: i + frame_size]
                 frame_powers.append(np.mean(frame**2))
 
             if frame_powers:
@@ -191,7 +210,8 @@ class DatasetCleaner:
             )
             low_freq_mask = f < 80
             if np.any(low_freq_mask):
-                low_freq_ratio = np.sum(psd[low_freq_mask]) / (np.sum(psd) + 1e-10)
+                low_freq_ratio = np.sum(
+                    psd[low_freq_mask]) / (np.sum(psd) + 1e-10)
                 metrics["low_freq_ratio"] = low_freq_ratio
 
                 if low_freq_ratio > 0.1:
