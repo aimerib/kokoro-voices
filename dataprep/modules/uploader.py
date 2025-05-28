@@ -195,7 +195,8 @@ dataset/
 │   ├── metadata.jsonl
 │   └── segment_.wav
 └── test/
-└── segment_*.wav
+    ├── segment_*.wav
+    └── metadata.jsonl
 ```
 
 Each `metadata.jsonl` contains:
