@@ -67,11 +67,17 @@ class AudioEnhancer:
             },
         }
 
-        self.config = self.configs[mode]
+        if mode == "auto":
+            self.config = self.configs["auto"]
+        else:
+            self.config = self.configs[mode]
 
         # Allow caller to override DeepFilter usage (add-on step)
         if enable_deepfilter is not None:
-            self.config["use_deepfilter"] = bool(enable_deepfilter)
+            if self.config.get("use_adaptive_enhancement"):
+                self.config["available_methods"].append("deepfilter")
+            else:
+                self.config["use_deepfilter"] = bool(enable_deepfilter)
 
         self._models_loaded = False
 
@@ -80,13 +86,13 @@ class AudioEnhancer:
         if self._models_loaded:
             return
 
-        if self.config["use_deepfilter"]:
+        if self.config.get("use_deepfilter"):
             self.logger.info("Loading DeepFilter model...")
 
             self.df_model, self.df_state, _ = init_df(
                 default_model="DeepFilterNet3")
 
-        if self.config["use_metricgan"]:
+        if self.config.get("use_metricgan"):
             self.logger.info("Loading MetricGAN+ model...")
 
             self.metricgan = SpectralMaskEnhancement.from_hparams(
