@@ -35,3 +35,12 @@ git+https://github.com/resemble-ai/resemble-enhance.git
 speechbrain
 demucs
 rich
+
+# StyleTTS2 for voice cloning pipeline
+styletts2>=0.1.6
+
+# Additional dependencies for StyleTTS2 pipeline
+pyyaml
+einops
+transformers
+omegaconf

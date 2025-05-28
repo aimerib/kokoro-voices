@@ -26,6 +26,18 @@ try:
 except ImportError:
     print("Warning: librosa and scipy required for audio similarity calculation")
 
+def format_duration(seconds: float) -> str:
+    """Format duration in seconds to a human-readable string."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = int(seconds % 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m {seconds}s"
+    else:
+        return f"{seconds}s"
+
 def apply_audio_augmentations(
     audio: torch.Tensor, training: bool = True
 ) -> torch.Tensor:
