@@ -55,6 +55,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import tempfile
 import shutil
+import soundfile as sf
 
 from accelerate import Accelerator
 from huggingface_hub import snapshot_download, HfApi, upload_folder
@@ -263,7 +264,7 @@ def extract_style_from_audio(model, audio: torch.Tensor | np.ndarray, sr: int = 
     directly.
     """
     try:
-        # Ensure numpy, correct sample-rate & mono
+        # Ensure numpy mono 24 kHz
         if isinstance(audio, torch.Tensor):
             audio_np = audio.cpu().numpy()
         else:
@@ -275,7 +276,14 @@ def extract_style_from_audio(model, audio: torch.Tensor | np.ndarray, sr: int = 
         if sr != 24000:
             audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=24000)
 
-        style_vec = model.compute_style(audio_np)  # returns np.ndarray (256,)
+        # StyleTTS2 expects a file path – write a short-lived temp WAV
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            sf.write(tmp.name, audio_np, 24000)
+            tmp_path = tmp.name
+
+        style_vec = model.compute_style(tmp_path)  # returns np.ndarray
+
+        os.remove(tmp_path)
         return torch.from_numpy(style_vec).float()
     except Exception as exc:
         print(f"Style extraction failed: {exc}")
@@ -950,7 +958,6 @@ def test_voice_generation(voice_tensor: torch.Tensor, output_dir: Path, name: st
                     full_audio = torch.cat(outputs)
                     output_path = output_dir / f"{name}_test_{i+1}.wav"
                     
-                    import soundfile as sf
                     sf.write(output_path, full_audio.numpy(), 24000)
                     print(f"✓ Generated test audio: {output_path}")
                 
