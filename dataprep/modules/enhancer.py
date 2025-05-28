@@ -106,21 +106,28 @@ class AudioEnhancer:
 
         # Apply enhancement stages
         if self.config.get("use_adaptive_enhancement"):
-            # Auto mode - analyze and select methods
-            quality_metrics = self._analyze_audio_quality(audio, sr)
-            selected_methods = self._select_enhancement_methods(
-                quality_metrics)
-            for method in selected_methods:
-                if method == "deepfilter":
-                    audio = self._apply_deepfilter(audio, sr)
-                elif method == "resemble_enhance":
-                    audio = self._apply_resemble_enhance(audio, sr)
-                elif method == "metricgan":
-                    audio = self._apply_metricgan(audio, sr)
-                elif method == "spectral_subtraction":
-                    audio = self._apply_spectral_subtraction(audio, sr)
-                elif method == "pitch_correction":
-                    audio = self._apply_pitch_correction(audio, sr)
+            try:
+                # Auto mode - analyze and select methods
+                quality_metrics = self._analyze_audio_quality(audio, sr)
+                selected_methods = self._select_enhancement_methods(
+                    quality_metrics)
+                self.logger.info(f"Selected enhancement methods: {selected_methods}")
+                
+                for method in selected_methods:
+                    if method == "deepfilter":
+                        audio = self._apply_deepfilter(audio, sr)
+                    elif method == "resemble_enhance":
+                        audio = self._apply_resemble_enhance(audio, sr)
+                    elif method == "metricgan":
+                        audio = self._apply_metricgan(audio, sr)
+                    elif method == "spectral_subtraction":
+                        audio = self._apply_spectral_subtraction(audio, sr)
+                    elif method == "pitch_correction":
+                        audio = self._apply_pitch_correction(audio, sr)
+            except Exception as e:
+                self.logger.error(f"Auto enhancement failed: {str(e)}")
+                # Fallback to no enhancement rather than crashing
+                self.logger.warning("Falling back to no enhancement")
         else:
             # Manual mode - use configured methods
             if self.config.get("use_deepfilter", False):
@@ -348,6 +355,9 @@ class AudioEnhancer:
     def _analyze_audio_quality(self, audio: torch.Tensor, sr: int) -> dict:
         """Analyze audio quality metrics to determine optimal enhancement methods"""
 
+        # Ensure audio is on the same device throughout
+        device = audio.device
+        
         # Calculate SNR (Signal-to-Noise Ratio)
         energy = torch.mean(audio ** 2)
         snr_db = 10 * torch.log10(energy + 1e-10)
@@ -355,7 +365,7 @@ class AudioEnhancer:
         # Calculate spectral centroid (brightness measure)
         stft = torch.stft(audio.squeeze(), n_fft=512, return_complex=True)
         magnitude = torch.abs(stft)
-        freqs = torch.linspace(0, sr/2, magnitude.shape[0])
+        freqs = torch.linspace(0, sr/2, magnitude.shape[0], device=device)
         spectral_centroid = torch.sum(
             magnitude * freqs.unsqueeze(1), dim=0) / (torch.sum(magnitude, dim=0) + 1e-10)
         avg_spectral_centroid = torch.mean(spectral_centroid)
@@ -373,19 +383,19 @@ class AudioEnhancer:
             torch.abs(audio) < silence_threshold).float() / len(audio.squeeze())
 
         quality_metrics = {
-            "snr_db": float(snr_db),
-            "spectral_centroid": float(avg_spectral_centroid),
-            "zero_crossing_rate": float(zcr),
-            "rms_energy": float(rms_energy),
-            "silence_ratio": float(silence_ratio),
-            "needs_noise_reduction": float(snr_db) < 15.0,
-            "needs_spectral_enhancement": float(avg_spectral_centroid) < sr * 0.1,
-            "needs_dynamics_processing": float(rms_energy) < 0.1 or float(silence_ratio) > 0.3,
+            "snr_db": float(snr_db.cpu()),
+            "spectral_centroid": float(avg_spectral_centroid.cpu()),
+            "zero_crossing_rate": float(zcr.cpu()),
+            "rms_energy": float(rms_energy.cpu()),
+            "silence_ratio": float(silence_ratio.cpu()),
+            "needs_noise_reduction": float(snr_db.cpu()) < 15.0,
+            "needs_spectral_enhancement": float(avg_spectral_centroid.cpu()) < sr * 0.1,
+            "needs_dynamics_processing": float(rms_energy.cpu()) < 0.1 or float(silence_ratio.cpu()) > 0.3,
         }
 
-        self.logger.info(f"Audio quality analysis: SNR={snr_db:.1f}dB, "
-                         f"Spectral centroid={avg_spectral_centroid:.0f}Hz, "
-                         f"Silence ratio={silence_ratio:.2f}")
+        self.logger.info(f"Audio quality analysis: SNR={snr_db.cpu():.1f}dB, "
+                         f"Spectral centroid={avg_spectral_centroid.cpu():.0f}Hz, "
+                         f"Silence ratio={silence_ratio.cpu():.2f}")
 
         return quality_metrics
 
