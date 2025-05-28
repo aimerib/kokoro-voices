@@ -83,6 +83,8 @@ except ImportError:
 # Kokoro imports for final validation
 from kokoro import KModel, KPipeline
 
+from contextlib import contextmanager
+
 # ---------------------------------------------------------------------------
 # Dataset for Style Extraction
 # ---------------------------------------------------------------------------
@@ -199,7 +201,12 @@ class StyleToKokoroProjection(nn.Module):
 # StyleTTS2 Style Extraction Functions
 # ---------------------------------------------------------------------------
 
-def load_styletts2_model(device: str = "cpu"):
+@contextmanager
+def allow_pickle():
+    with torch.serialization.safe_globals([getattr]):
+        yield
+
+def load_styletts2_model(device="cpu"):
     """
     Load StyleTTS2 model for style extraction.
     
@@ -209,39 +216,15 @@ def load_styletts2_model(device: str = "cpu"):
     if not STYLETTS2_AVAILABLE:
         raise ImportError("StyleTTS2 not available. Install with: pip install styletts2")
     
-    try:
-        # Use the StyleTTS2 package API
-        # Try to handle the weights_only issue by setting torch serialization
-        import torch.serialization
-        
-        # Add safe globals to handle the getattr issue
+    with allow_pickle():
         try:
-            torch.serialization.add_safe_globals([getattr])
-        except:
-            pass
-        
-        # Try loading with weights_only=False for compatibility
-        original_load = torch.load
-        def patched_load(*args, **kwargs):
-            if 'weights_only' not in kwargs:
-                kwargs['weights_only'] = False
-            return original_load(*args, **kwargs)
-        
-        torch.load = patched_load
-        
-        try:
+            # Use the StyleTTS2 package API
             model = tts.StyleTTS2()
             print("✓ Loaded StyleTTS2 model using package API")
             return model, "simple"
-        finally:
-            # Restore original torch.load
-            torch.load = original_load
-            
-    except Exception as e:
-        print(f"StyleTTS2 loading failed: {e}")
-        print("This is expected if StyleTTS2 models aren't downloaded yet.")
-        print("The pipeline will fall back to audio feature extraction.")
-        raise RuntimeError("Could not load StyleTTS2 model")
+        except Exception as e:
+            print(f"StyleTTS2 loading failed: {e}")
+            raise RuntimeError("Could not load StyleTTS2 model")
 
 def extract_styletts2_embeddings(
     dataset: StyleExtractionDataset,
