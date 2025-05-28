@@ -123,13 +123,13 @@ class AudioEnhancer:
                     audio = self._apply_pitch_correction(audio, sr)
         else:
             # Manual mode - use configured methods
-            if self.config["use_deepfilter"]:
+            if self.config.get("use_deepfilter", False):
                 audio = self._apply_deepfilter(audio, sr)
 
-            if self.config["use_resemble_enhance"]:
+            if self.config.get("use_resemble_enhance", False):
                 audio = self._apply_resemble_enhance(audio, sr)
 
-            if self.config["use_metricgan"]:
+            if self.config.get("use_metricgan", False):
                 audio = self._apply_metricgan(audio, sr)
 
         # Normalize and save
@@ -402,8 +402,6 @@ class AudioEnhancer:
             elif quality_metrics["snr_db"] < 12.0:
                 # Moderate noise reduction
                 selected_methods.append("deepfilter")
-            else:
-                selected_methods.append("voice_isolation")  # Light cleaning
 
         # Spectral enhancement for dull audio
         if quality_metrics["needs_spectral_enhancement"]:
@@ -414,12 +412,6 @@ class AudioEnhancer:
             selected_methods.append("pitch_correction")
             if quality_metrics["rms_energy"] < 0.05:
                 selected_methods.append("metricgan")  # For very quiet audio
-
-        # If audio is already good quality, minimal processing
-        if (not quality_metrics["needs_noise_reduction"] and
-            not quality_metrics["needs_spectral_enhancement"] and
-                not quality_metrics["needs_dynamics_processing"]):
-            selected_methods.append("voice_isolation")  # Light touch-up only
 
         self.logger.info(f"Selected enhancement methods: {selected_methods}")
         return selected_methods
