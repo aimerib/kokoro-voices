@@ -58,7 +58,7 @@ import shutil
 import soundfile as sf
 
 from accelerate import Accelerator
-from huggingface_hub import snapshot_download, HfApi, upload_folder
+from huggingface_hub import hf_hub_download, snapshot_download, HfApi, upload_folder
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # Import utilities (reuse some from original training)
@@ -698,13 +698,15 @@ def get_reference_kokoro_embedding(device: str) -> torch.Tensor:
     This provides a reasonable target for embedding characteristics.
     """
     try:
+        f = hf_hub_download(repo_id='hexgrad/Kokoro-82M', filename=f'voices/af_heart.pt')
+        reference_voice = torch.load(f, weights_only=True)
         # Try to load a reference voice from Kokoro's built-in voices
-        from kokoro import KPipeline
-        pipeline = KPipeline(lang_code="a")
+        # from kokoro import KPipeline
+        # pipeline = KPipeline(lang_code="a")
         
-        # Use the default voice as reference (usually a good quality voice)
-        # This gives us a realistic target for embedding characteristics
-        reference_voice = pipeline.voice  # Default voice tensor
+        # # Use the default voice as reference (usually a good quality voice)
+        # # This gives us a realistic target for embedding characteristics
+        # reference_voice = pipeline.voice  # Default voice tensor
         
         if reference_voice is not None and reference_voice.dim() == 3:
             # Average across phoneme positions to get base embedding
