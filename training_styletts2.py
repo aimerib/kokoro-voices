@@ -92,6 +92,19 @@ from kokoro import KModel, KPipeline
 from contextlib import contextmanager
 
 # ---------------------------------------------------------------------------
+# PyTorch 2.6 weights-only default workaround
+# ---------------------------------------------------------------------------
+# StyleTTS2 checkpoints contain full pickled objects.  We explicitly mark
+# the builtin `getattr` as safe so that internal `torch.load()` calls inside
+# the styletts2 package succeed even when `weights_only=True` is implicit.
+
+import torch.serialization as _ts  # type: ignore
+try:
+    _ts.add_safe_globals([getattr])  # allowlist getattr globally
+except Exception:
+    pass  # running on PyTorch<2.6 or already patched
+
+# ---------------------------------------------------------------------------
 # Dataset for Style Extraction
 # ---------------------------------------------------------------------------
 
