@@ -599,6 +599,72 @@ def estimate_pitch_features(audio: torch.Tensor, sample_rate: int) -> torch.Tens
 # Kokoro Projection Training
 # ---------------------------------------------------------------------------
 
+def visualize_embedding(embedding_np):
+    """Create a PCA visualization of an embedding vector for W&B visualization."""
+    try:
+        import numpy as np
+        import matplotlib.pyplot as plt
+        
+        # Reshape if needed to ensure 2D array with samples as rows
+        if embedding_np.ndim == 1:
+            # For a single vector, we can't do PCA, so create a simple distribution plot
+            data = embedding_np
+            
+            # Create a histogram plot
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.hist(data, bins=30, alpha=0.7)
+            ax.set_title('Distribution of Embedding Values')
+            ax.set_xlabel('Value')
+            ax.set_ylabel('Frequency')
+            ax.grid(True)
+            
+            # Add basic statistics to the plot
+            stats_text = f"Mean: {np.mean(data):.3f}\nStd: {np.std(data):.3f}\n"
+            stats_text += f"Min: {np.min(data):.3f}\nMax: {np.max(data):.3f}"
+            ax.text(0.95, 0.95, stats_text, transform=ax.transAxes, 
+                    verticalalignment='top', horizontalalignment='right',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            return fig
+        else:
+            # Only do PCA if we have enough samples
+            if embedding_np.shape[0] > 2:
+                from sklearn.decomposition import PCA
+                # Apply PCA to reduce to 2 dimensions
+                pca = PCA(n_components=2)
+                reduced_data = pca.fit_transform(embedding_np)
+                
+                # Create a scatter plot
+                fig, ax = plt.subplots(figsize=(8, 8))
+                ax.scatter(reduced_data[:, 0], reduced_data[:, 1], alpha=0.7)
+                
+                # Add explained variance as title
+                explained_variance = pca.explained_variance_ratio_
+                ax.set_title(f'PCA of Embeddings (Explained variance: {explained_variance[0]:.2f}, {explained_variance[1]:.2f})')
+                
+                ax.set_xlabel('Principal Component 1')
+                ax.set_ylabel('Principal Component 2')
+                ax.grid(True)
+                
+                return fig
+            else:
+                # Create a simple scatter plot without PCA
+                fig, ax = plt.subplots(figsize=(8, 8))
+                ax.scatter(np.arange(embedding_np.shape[0]), embedding_np.mean(axis=1), alpha=0.7)
+                ax.set_title('Mean Embedding Values')
+                ax.set_xlabel('Sample Index')
+                ax.set_ylabel('Mean Value')
+                ax.grid(True)
+                return fig
+            
+    except Exception as e:
+        print(f"Error visualizing embedding: {e}")
+        # Return a blank figure if visualization fails
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.text(0.5, 0.5, f"Visualization error: {e}", 
+                horizontalalignment='center', verticalalignment='center')
+        return fig
+
 def train_kokoro_projection(
     style_embeddings: torch.Tensor,
     target_samples: List[Tuple[str, torch.Tensor]],
@@ -746,12 +812,21 @@ def train_kokoro_projection(
                 generated_audio = generated_audio[..., :min_len]
                 target_audio = target_audio[..., :min_len]
                 
-                # Convert to mel spectrograms
+                # Convert to mel spectrograms - ensure same dimensions
                 generated_mel = mel_transform(generated_audio)
-                target_mel = mel_transform(target_audio.unsqueeze(0))
+                target_mel = mel_transform(target_audio.unsqueeze(0)).squeeze(0)  # Remove batch dim to match
                 
-                # Compute loss
+                # Compute loss - ensure the dimensions match
+                if generated_mel.shape != target_mel.shape:
+                    print(f"Warning: Shape mismatch - generated: {generated_mel.shape}, target: {target_mel.shape}")
+                    continue
+                
                 loss = F.mse_loss(generated_mel, target_mel)
+                
+                # Ensure loss requires grad
+                if not loss.requires_grad:
+                    print("Warning: Loss doesn't require grad - skipping batch")
+                    continue
                 
                 # Backward pass
                 optimizer.zero_grad()
@@ -827,44 +902,6 @@ def train_kokoro_projection(
     
     print(f"Projection training completed. Best loss: {best_loss:.4f}")
     return projection
-
-def visualize_embedding(embedding_np):
-    """Create a PCA visualization of an embedding vector for W&B visualization."""
-    try:
-        import numpy as np
-        from sklearn.decomposition import PCA
-        import matplotlib.pyplot as plt
-        
-        # Reshape if needed to ensure 2D array with samples as rows
-        if embedding_np.ndim == 1:
-            data = embedding_np.reshape(1, -1)
-        else:
-            data = embedding_np
-            
-        # Apply PCA to reduce to 2 dimensions
-        pca = PCA(n_components=2)
-        reduced_data = pca.fit_transform(data)
-        
-        # Create a scatter plot
-        fig, ax = plt.subplots(figsize=(8, 8))
-        ax.scatter(reduced_data[:, 0], reduced_data[:, 1], alpha=0.7)
-        
-        # Add explained variance as title
-        explained_variance = pca.explained_variance_ratio_
-        ax.set_title(f'PCA of Embedding (Explained variance: {explained_variance[0]:.2f}, {explained_variance[1]:.2f})')
-        
-        ax.set_xlabel('Principal Component 1')
-        ax.set_ylabel('Principal Component 2')
-        ax.grid(True)
-        
-        return fig
-    except Exception as e:
-        print(f"Error visualizing embedding: {e}")
-        # Return a blank figure if visualization fails
-        fig, ax = plt.subplots(figsize=(8, 8))
-        ax.text(0.5, 0.5, f"Visualization error: {e}", 
-                horizontalalignment='center', verticalalignment='center')
-        return fig
 
 # ---------------------------------------------------------------------------
 # Main Training Pipeline
@@ -1036,6 +1073,10 @@ def train_styletts2_to_kokoro(
         projection_model.eval()
         with torch.no_grad():
             final_kokoro_embedding = projection_model(avg_style_embedding.to(device))
+            
+            # Ensure the embedding has the right dimensions
+            if final_kokoro_embedding.dim() == 1:
+                final_kokoro_embedding = final_kokoro_embedding.unsqueeze(0)
         
         # Expand to length-dependent format for Kokoro compatibility
         MAX_PHONEME_LEN = 510
@@ -1044,7 +1085,7 @@ def train_styletts2_to_kokoro(
         for i in range(MAX_PHONEME_LEN):
             # Add slight variation based on length for better prosody
             length_factor = 1.0 + (i / MAX_PHONEME_LEN) * 0.05
-            varied_embedding = final_kokoro_embedding.squeeze(0) * length_factor
+            varied_embedding = final_kokoro_embedding.squeeze() * length_factor
             kokoro_voice_tensor[i, 0, :] = varied_embedding.cpu()
         
         # Save final voice embedding
