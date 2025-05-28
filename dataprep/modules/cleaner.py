@@ -99,18 +99,19 @@ class DatasetCleaner:
                     except Exception as e:
                         self.logger.error(
                             "Failed to move rejected file %s: %s", audio_path, str(e))
-                # Remove rejected folder
-                try:
-                    split_rejected_dir.rmdir()
-                except Exception as e:
-                    self.logger.error(
-                        "Failed to remove rejected folder %s: %s", split_rejected_dir, str(e))
 
                 # Save cleaned metadata
                 if kept_metadata:
                     with open(metadata_file, "w", encoding="utf-8") as f:
                         for item in kept_metadata:
                             f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+                # Remove rejected folder
+                try:
+                    rejected_dir.rmdir()
+                except Exception as e:
+                    self.logger.error(
+                        "Failed to remove rejected folder %s: %s", rejected_dir, str(e))
 
                 self.logger.info(
                     "Kept %s/%s files in %s",
