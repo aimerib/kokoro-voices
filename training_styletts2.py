@@ -839,7 +839,13 @@ def train_kokoro_projection(
                 
                 # Create mel predictor if not exists and update optimizer
                 if not hasattr(projection, 'mel_predictor'):
-                    projection.mel_predictor = nn.Linear(256, target_mel.numel()).to(device)
+                    # Use a smaller, more flexible predictor that outputs mel features
+                    projection.mel_predictor = nn.Sequential(
+                        nn.Linear(256, 512),
+                        nn.ReLU(),
+                        nn.Linear(512, 80),  # Output 80 mel bins (frequency dimension)
+                        nn.Tanh()
+                    ).to(device)
                     # Update optimizer to include new parameters
                     optimizer = torch.optim.Adam(projection.parameters(), lr=lr)
                     mel_predictor_added = True
@@ -856,19 +862,24 @@ def train_kokoro_projection(
                 # 3. Embedding smoothness loss (encourage stable embeddings)
                 smoothness_loss = torch.mean(kokoro_embedding ** 2) * 0.01
                 
-                # 4. Try to match spectral characteristics indirectly
-                # Generate a simple "predicted" mel using the embedding as a feature vector
-                # This is a simplified proxy for the full generation
+                # 4. Spectral characteristics matching
+                # Generate predicted mel features (frequency profile)
                 embedding_flat = kokoro_embedding.view(-1)  # Flatten to 1D
+                predicted_mel_profile = projection.mel_predictor(embedding_flat)  # [80] - frequency profile
                 
-                predicted_mel_flat = projection.mel_predictor(embedding_flat)
-                predicted_mel = predicted_mel_flat.view(target_mel.shape)
+                # Compare with average frequency profile of target
+                target_mel_profile = target_mel.mean(dim=1)  # Average over time -> [80]
                 
-                # Spectral loss
-                spectral_loss = F.mse_loss(predicted_mel, target_mel.detach())
+                # Spectral loss - compare frequency profiles
+                spectral_loss = F.mse_loss(predicted_mel_profile, target_mel_profile.detach())
+                
+                # 5. Additional embedding consistency loss
+                # Encourage the embedding to be similar to a "canonical" voice embedding
+                canonical_embedding = torch.randn_like(kokoro_embedding) * 0.05  # Small random target
+                consistency_loss = F.mse_loss(kokoro_embedding, canonical_embedding.detach()) * 0.001
                 
                 # Combine losses
-                loss = spectral_loss + embedding_reg_loss + norm_loss + smoothness_loss
+                loss = spectral_loss + embedding_reg_loss + norm_loss + smoothness_loss + consistency_loss
                 
                 # Verify loss has gradients
                 if not loss.requires_grad:
