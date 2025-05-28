@@ -14,6 +14,7 @@ from rich.table import Table
 from rich.panel import Panel
 
 from modules.uploader import HuggingFaceUploader
+from modules.cleaner import DatasetCleaner
 from utilities import get_module_logger
 
 
@@ -24,6 +25,7 @@ class DatasetUploader:
         self.logger = get_module_logger(__name__)
         self.console = Console()
         self.uploader = HuggingFaceUploader()
+        self.cleaner = DatasetCleaner()
 
     def validate_dataset(self, dataset_dir: Path) -> dict:
         """Validate that dataset is properly prepared"""
@@ -211,6 +213,134 @@ class DatasetUploader:
             self.console.print(f"\n❌ [red]Upload failed: {e}[/red]")
             raise
 
+    def analyze_confidence_distribution(self, dataset_dir: Path) -> dict:
+        """Analyze confidence score distribution in the dataset"""
+        confidence_scores = []
+        stats = {"splits": {}}
+
+        for split in ["train", "validation", "test"]:
+            split_dir = dataset_dir / split
+            if not split_dir.exists():
+                continue
+
+            metadata_file = split_dir / "metadata.jsonl"
+            if not metadata_file.exists():
+                continue
+
+            split_confidences = []
+            with open(metadata_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    entry = json.loads(line)
+                    confidence = entry.get("confidence", 1.0)
+                    confidence_scores.append(confidence)
+                    split_confidences.append(confidence)
+
+            if split_confidences:
+                stats["splits"][split] = {
+                    "count": len(split_confidences),
+                    "mean": sum(split_confidences) / len(split_confidences),
+                    "min": min(split_confidences),
+                    "max": max(split_confidences),
+                    "below_0_8": sum(1 for c in split_confidences if c < 0.8),
+                    "below_0_9": sum(1 for c in split_confidences if c < 0.9),
+                }
+
+        if confidence_scores:
+            stats["overall"] = {
+                "total": len(confidence_scores),
+                "mean": sum(confidence_scores) / len(confidence_scores),
+                "min": min(confidence_scores),
+                "max": max(confidence_scores),
+                "below_0_8": sum(1 for c in confidence_scores if c < 0.8),
+                "below_0_9": sum(1 for c in confidence_scores if c < 0.9),
+            }
+
+        return stats
+
+    def display_confidence_analysis(self, stats: dict):
+        """Display confidence score analysis"""
+        if not stats.get("overall"):
+            self.console.print("❌ [red]No confidence data found in dataset[/red]")
+            return
+
+        self.console.print("\n📊 [cyan]Confidence Score Analysis[/cyan]")
+        
+        # Overall stats table
+        overall_table = Table(title="Overall Statistics")
+        overall_table.add_column("Metric", style="cyan")
+        overall_table.add_column("Value", style="magenta")
+        
+        overall = stats["overall"]
+        overall_table.add_row("Total entries", str(overall["total"]))
+        overall_table.add_row("Mean confidence", f"{overall['mean']:.3f}")
+        overall_table.add_row("Min confidence", f"{overall['min']:.3f}")
+        overall_table.add_row("Max confidence", f"{overall['max']:.3f}")
+        overall_table.add_row("Entries < 0.8", f"{overall['below_0_8']} ({overall['below_0_8']/overall['total']*100:.1f}%)")
+        overall_table.add_row("Entries < 0.9", f"{overall['below_0_9']} ({overall['below_0_9']/overall['total']*100:.1f}%)")
+        
+        self.console.print(overall_table)
+
+        # Per-split stats
+        if stats.get("splits"):
+            splits_table = Table(title="Per-Split Statistics")
+            splits_table.add_column("Split", style="cyan")
+            splits_table.add_column("Count", style="magenta")
+            splits_table.add_column("Mean", style="magenta")
+            splits_table.add_column("< 0.8", style="red")
+            splits_table.add_column("< 0.9", style="yellow")
+
+            for split_name, split_stats in stats["splits"].items():
+                splits_table.add_row(
+                    split_name,
+                    str(split_stats["count"]),
+                    f"{split_stats['mean']:.3f}",
+                    f"{split_stats['below_0_8']} ({split_stats['below_0_8']/split_stats['count']*100:.1f}%)",
+                    f"{split_stats['below_0_9']} ({split_stats['below_0_9']/split_stats['count']*100:.1f}%)"
+                )
+
+            self.console.print(splits_table)
+
+    def clean_dataset_interactive(self, dataset_dir: Path) -> bool:
+        """Interactive dataset cleaning with confidence and quality filters"""
+        self.console.print("\n🧹 [cyan]Dataset Cleaning Options[/cyan]")
+        
+        # Analyze current confidence distribution
+        confidence_stats = self.analyze_confidence_distribution(dataset_dir)
+        self.display_confidence_analysis(confidence_stats)
+
+        if not confidence_stats.get("overall"):
+            self.console.print("⚠️ [yellow]No confidence scores found, skipping confidence filtering[/yellow]")
+        else:
+            # Ask about confidence filtering
+            if Confirm.ask("\nFilter by confidence score?"):
+                min_confidence = float(Prompt.ask(
+                    "Minimum confidence score (0.0-1.0)",
+                    default="0.8"
+                ))
+                
+                self.console.print(f"🔍 [cyan]Filtering entries with confidence < {min_confidence}...[/cyan]")
+                confidence_report = self.cleaner.filter_by_confidence(dataset_dir, min_confidence)
+                
+                self.console.print(f"✅ Confidence filtering complete:")
+                self.console.print(f"  • Kept: {confidence_report['total_kept']}/{confidence_report['total_analyzed']} entries")
+                self.console.print(f"  • Removed: {confidence_report['total_rejected']} low-confidence entries")
+
+        # Ask about quality cleaning
+        if Confirm.ask("\nRun quality-based cleaning? (removes audio with poor SNR, clipping, etc.)"):
+            self.console.print("🔍 [cyan]Running quality analysis and cleaning...[/cyan]")
+            quality_report = self.cleaner.clean(dataset_dir)
+            
+            self.console.print(f"✅ Quality cleaning complete:")
+            self.console.print(f"  • Kept: {quality_report['total_kept']}/{quality_report['total_analyzed']} files")
+            self.console.print(f"  • Removed: {quality_report['total_rejected']} poor-quality files")
+            
+            if quality_report["rejection_reasons"]:
+                self.console.print("  • Rejection reasons:")
+                for reason, count in quality_report["rejection_reasons"].items():
+                    self.console.print(f"    - {reason.replace('_', ' ').title()}: {count}")
+
+        return True
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -226,6 +356,9 @@ Examples:
 
   # Public repository
   python upload_dataset.py ./my-voice-dataset --repo-id username/my-voice --public
+
+  # Clean dataset before upload
+  python upload_dataset.py ./my-voice-dataset --clean --min-confidence 0.8
 
   # Skip validation (not recommended)
   python upload_dataset.py ./my-voice-dataset --repo-id username/my-voice --skip-validation
@@ -262,6 +395,25 @@ Examples:
     )
 
     parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Clean dataset before upload (confidence + quality filtering)"
+    )
+
+    parser.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.8,
+        help="Minimum confidence score for filtering (default: 0.8)"
+    )
+
+    parser.add_argument(
+        "--quality-clean",
+        action="store_true",
+        help="Run quality-based cleaning (SNR, clipping, etc.)"
+    )
+
+    parser.add_argument(
         "--yes",
         action="store_true",
         help="Skip confirmation prompts"
@@ -287,6 +439,28 @@ Examples:
     ))
 
     try:
+        # Optional cleaning step
+        if args.clean:
+            console.print("\n🧹 [cyan]Cleaning dataset before upload...[/cyan]")
+            
+            # Analyze confidence distribution
+            confidence_stats = uploader.analyze_confidence_distribution(args.dataset_dir)
+            uploader.display_confidence_analysis(confidence_stats)
+            
+            if confidence_stats.get("overall"):
+                # Confidence filtering
+                console.print(f"\n🔍 [cyan]Applying confidence filter (>= {args.min_confidence})...[/cyan]")
+                confidence_report = uploader.cleaner.filter_by_confidence(
+                    args.dataset_dir, args.min_confidence
+                )
+                console.print(f"✅ Kept {confidence_report['total_kept']}/{confidence_report['total_analyzed']} entries")
+            
+            # Quality cleaning
+            if args.quality_clean:
+                console.print("\n🔍 [cyan]Running quality-based cleaning...[/cyan]")
+                quality_report = uploader.cleaner.clean(args.dataset_dir)
+                console.print(f"✅ Kept {quality_report['total_kept']}/{quality_report['total_analyzed']} files")
+
         # Validate dataset
         if not args.skip_validation:
             console.print(

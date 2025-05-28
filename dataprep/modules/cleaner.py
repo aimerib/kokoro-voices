@@ -31,6 +31,109 @@ class DatasetCleaner:
         self.min_peak = min_peak
         self.logger = get_module_logger(__name__)
 
+    def filter_by_confidence(self, dataset_dir: Path, min_confidence: float = 0.8) -> Dict:
+        """Filter dataset entries by confidence score"""
+        self.logger.info("Filtering dataset by confidence score >= %.2f", min_confidence)
+
+        confidence_report = {
+            "total_analyzed": 0,
+            "total_kept": 0,
+            "total_rejected": 0,
+            "confidence_threshold": min_confidence,
+            "confidence_stats": {
+                "mean_before": 0,
+                "mean_after": 0,
+                "min_before": 1.0,
+                "max_before": 0.0,
+                "min_after": 1.0,
+                "max_after": 0.0
+            }
+        }
+
+        all_confidences = []
+        kept_confidences = []
+
+        # Process each split
+        for split in ["train", "validation", "test"]:
+            split_dir = dataset_dir / split
+            if not split_dir.exists():
+                continue
+
+            self.logger.info("Processing %s split for confidence filtering", split)
+
+            metadata_file = split_dir / "metadata.jsonl"
+            if not metadata_file.exists():
+                continue
+
+            # Load metadata
+            with open(metadata_file, "r", encoding="utf-8") as f:
+                metadata = [json.loads(line) for line in f]
+
+            # Filter by confidence
+            filtered_metadata = []
+
+            for item in tqdm(metadata, desc=f"Filtering {split} by confidence"):
+                confidence = item.get("confidence", 1.0)
+                all_confidences.append(confidence)
+                confidence_report["total_analyzed"] += 1
+
+                if confidence >= min_confidence:
+                    filtered_metadata.append(item)
+                    kept_confidences.append(confidence)
+                    confidence_report["total_kept"] += 1
+                else:
+                    confidence_report["total_rejected"] += 1
+                    
+                    # Remove corresponding audio file
+                    audio_path = split_dir / item["file_name"]
+                    if audio_path.exists():
+                        try:
+                            audio_path.unlink()
+                            self.logger.debug("Removed low-confidence file: %s", audio_path.name)
+                        except Exception as e:
+                            self.logger.warning("Failed to remove %s: %s", audio_path.name, e)
+
+            # Save filtered metadata
+            if filtered_metadata:
+                with open(metadata_file, "w", encoding="utf-8") as f:
+                    for item in filtered_metadata:
+                        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+                self.logger.info(
+                    "Kept %s/%s files in %s (%.1f%% confidence filter)",
+                    len(filtered_metadata),
+                    len(metadata),
+                    split,
+                    len(filtered_metadata) / len(metadata) * 100
+                )
+
+        # Calculate confidence statistics
+        if all_confidences:
+            confidence_report["confidence_stats"]["mean_before"] = np.mean(all_confidences)
+            confidence_report["confidence_stats"]["min_before"] = np.min(all_confidences)
+            confidence_report["confidence_stats"]["max_before"] = np.max(all_confidences)
+
+        if kept_confidences:
+            confidence_report["confidence_stats"]["mean_after"] = np.mean(kept_confidences)
+            confidence_report["confidence_stats"]["min_after"] = np.min(kept_confidences)
+            confidence_report["confidence_stats"]["max_after"] = np.max(kept_confidences)
+
+        # Generate summary
+        self.logger.info("\nConfidence Filtering Summary:")
+        self.logger.info("  Total analyzed: %s", confidence_report["total_analyzed"])
+        self.logger.info(
+            "  Kept: %s (%.1f%%)",
+            confidence_report["total_kept"],
+            confidence_report["total_kept"] / max(1, confidence_report["total_analyzed"]) * 100,
+        )
+        self.logger.info("  Rejected: %s", confidence_report["total_rejected"])
+        if all_confidences:
+            self.logger.info("  Mean confidence before: %.3f", confidence_report["confidence_stats"]["mean_before"])
+        if kept_confidences:
+            self.logger.info("  Mean confidence after: %.3f", confidence_report["confidence_stats"]["mean_after"])
+
+        return confidence_report
+
     def clean(self, dataset_dir: Path) -> Dict:
         """Clean dataset by removing low-quality samples"""
         self.logger.info("Cleaning dataset: %s", dataset_dir)

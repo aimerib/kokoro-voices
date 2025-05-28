@@ -73,6 +73,16 @@ class DatasetUploadTUI:
 
             return dataset_dir
 
+    def offer_dataset_cleaning(self, dataset_dir: Path) -> bool:
+        """Offer dataset cleaning options to the user"""
+        self.console.print("\n🧹 [cyan]Dataset Cleaning Options[/cyan]")
+        
+        if not Confirm.ask("Would you like to clean the dataset before upload?"):
+            return False
+
+        # Run interactive cleaning
+        return self.uploader.clean_dataset_interactive(dataset_dir)
+
     def get_repository_config(self) -> dict:
         """Get HuggingFace repository configuration"""
         self.console.print(
@@ -139,7 +149,10 @@ class DatasetUploadTUI:
                 self.console.print("Upload cancelled.")
                 return
 
-            # Step 2: Validate dataset
+            # Step 2: Offer dataset cleaning
+            self.offer_dataset_cleaning(dataset_dir)
+
+            # Step 3: Validate dataset
             self.console.print("\n🔍 [cyan]Validating dataset...[/cyan]")
             validation = self.uploader.validate_dataset(dataset_dir)
             self.uploader.display_validation_results(validation)
@@ -155,17 +168,17 @@ class DatasetUploadTUI:
                     self.console.print("Upload cancelled.")
                     return
 
-            # Step 3: Get repository configuration
+            # Step 4: Get repository configuration
             config = self.get_repository_config()
 
-            # Step 4: Show summary and confirm
+            # Step 5: Show summary and confirm
             self.show_upload_summary(dataset_dir, config, validation)
 
             if not Confirm.ask("\n🚀 Proceed with upload?"):
                 self.console.print("Upload cancelled.")
                 return
 
-            # Step 5: Upload
+            # Step 6: Upload
             self.uploader.upload_dataset(
                 dataset_dir=dataset_dir,
                 repo_id=config["repo_id"],
