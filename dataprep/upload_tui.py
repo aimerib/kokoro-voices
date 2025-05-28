@@ -157,6 +157,11 @@ class DatasetUploadTUI:
             validation = self.uploader.validate_dataset(dataset_dir)
             self.uploader.display_validation_results(validation)
 
+            # Check for orphaned files  
+            self.console.print("\n🔍 [cyan]Checking for orphaned files...[/cyan]")
+            orphan_report = self.uploader.check_for_orphaned_files(dataset_dir)
+            self.uploader.display_orphan_analysis(orphan_report)
+
             if not validation["valid"]:
                 self.console.print("\n❌ [red]Dataset validation failed![/red]")
                 if not Confirm.ask("Upload anyway? (not recommended)"):
@@ -165,6 +170,12 @@ class DatasetUploadTUI:
 
             if validation["warnings"]:
                 if not Confirm.ask("\nProceed despite warnings?"):
+                    self.console.print("Upload cancelled.")
+                    return
+
+            # Warn about orphaned files
+            if orphan_report["total_orphaned"] > 0:
+                if not Confirm.ask(f"\nProceed with upload? ({orphan_report['total_orphaned']} orphaned files will NOT be uploaded)"):
                     self.console.print("Upload cancelled.")
                     return
 

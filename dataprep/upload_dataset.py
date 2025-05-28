@@ -257,6 +257,49 @@ class DatasetUploader:
 
         return stats
 
+    def check_for_orphaned_files(self, dataset_dir: Path) -> dict:
+        """Check for audio files that exist but aren't referenced in metadata"""
+        orphan_report = {"splits": {}, "total_orphaned": 0, "total_referenced": 0}
+
+        for split in ["train", "validation", "test"]:
+            split_dir = dataset_dir / split
+            if not split_dir.exists():
+                continue
+
+            # Get all audio files in directory
+            audio_files = set(f.name for f in split_dir.glob("*.wav"))
+            
+            # Get files referenced in metadata
+            referenced_files = set()
+            metadata_file = split_dir / "metadata.jsonl"
+            if metadata_file.exists():
+                try:
+                    with open(metadata_file, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            entry = json.loads(line)
+                            if "file_name" in entry:
+                                referenced_files.add(entry["file_name"])
+                except Exception as e:
+                    self.logger.warning("Error reading %s metadata: %s", split, e)
+
+            # Find orphaned files
+            orphaned_files = audio_files - referenced_files
+            missing_files = referenced_files - audio_files
+
+            orphan_report["splits"][split] = {
+                "total_audio_files": len(audio_files),
+                "referenced_files": len(referenced_files),
+                "orphaned_files": len(orphaned_files),
+                "missing_files": len(missing_files),
+                "orphaned_list": list(orphaned_files)[:10],  # First 10 for display
+                "missing_list": list(missing_files)[:10]     # First 10 for display
+            }
+
+            orphan_report["total_orphaned"] += len(orphaned_files)
+            orphan_report["total_referenced"] += len(referenced_files)
+
+        return orphan_report
+
     def display_confidence_analysis(self, stats: dict):
         """Display confidence score analysis"""
         if not stats.get("overall"):
@@ -299,6 +342,41 @@ class DatasetUploader:
                 )
 
             self.console.print(splits_table)
+
+    def display_orphan_analysis(self, orphan_report: dict):
+        """Display orphaned files analysis"""
+        if orphan_report["total_orphaned"] == 0:
+            self.console.print("✅ [green]No orphaned files found - all audio files are referenced in metadata[/green]")
+            return
+
+        self.console.print(f"\n⚠️ [yellow]Found {orphan_report['total_orphaned']} orphaned audio files[/yellow]")
+        self.console.print("[dim]These files exist on disk but aren't referenced in metadata and won't be uploaded.[/dim]")
+
+        # Create table for each split
+        for split_name, split_data in orphan_report["splits"].items():
+            if split_data["orphaned_files"] > 0 or split_data["missing_files"] > 0:
+                self.console.print(f"\n[cyan]{split_name.title()} Split:[/cyan]")
+                
+                split_table = Table(show_header=False, box=None)
+                split_table.add_column("Type", style="cyan", width=20)
+                split_table.add_column("Count", style="magenta")
+
+                split_table.add_row("Total audio files", str(split_data["total_audio_files"]))
+                split_table.add_row("Referenced in metadata", str(split_data["referenced_files"]))
+                
+                if split_data["orphaned_files"] > 0:
+                    split_table.add_row("Orphaned files", f"[red]{split_data['orphaned_files']}[/red]")
+                    
+                if split_data["missing_files"] > 0:
+                    split_table.add_row("Missing files", f"[red]{split_data['missing_files']}[/red]")
+
+                self.console.print(split_table)
+
+                # Show some example orphaned files
+                if split_data["orphaned_list"]:
+                    self.console.print(f"[dim]Example orphaned files: {', '.join(split_data['orphaned_list'][:5])}[/dim]")
+
+        self.console.print(f"\n💡 [blue]Only {orphan_report['total_referenced']} files will be uploaded to HuggingFace[/blue]")
 
     def clean_dataset_interactive(self, dataset_dir: Path) -> bool:
         """Interactive dataset cleaning with confidence and quality filters"""
@@ -468,6 +546,11 @@ Examples:
             validation = uploader.validate_dataset(args.dataset_dir)
             uploader.display_validation_results(validation)
 
+            # Check for orphaned files
+            console.print("\n🔍 [cyan]Checking for orphaned files...[/cyan]")
+            orphan_report = uploader.check_for_orphaned_files(args.dataset_dir)
+            uploader.display_orphan_analysis(orphan_report)
+
             if not validation["valid"]:
                 console.print(
                     "\n❌ [red]Cannot upload invalid dataset. Fix errors first or use --skip-validation[/red]")
@@ -475,6 +558,12 @@ Examples:
 
             if validation["warnings"] and not args.yes:
                 if not Confirm.ask("\nProceed despite warnings?"):
+                    console.print("Upload cancelled.")
+                    sys.exit(0)
+
+            # Warn about orphaned files
+            if orphan_report["total_orphaned"] > 0 and not args.yes:
+                if not Confirm.ask(f"\nProceed with upload? ({orphan_report['total_orphaned']} orphaned files will NOT be uploaded)"):
                     console.print("Upload cancelled.")
                     sys.exit(0)
 

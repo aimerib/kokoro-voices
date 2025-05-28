@@ -2,11 +2,12 @@
 """HuggingFace dataset uploader module"""
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 from huggingface_hub import HfApi, upload_folder
 import logging
 import shutil
 import tempfile
+import json
 from utilities import get_module_logger
 
 
@@ -17,6 +18,63 @@ class HuggingFaceUploader:
         self.logger = get_module_logger(__name__)
         self.api = HfApi()
         self.logger.setLevel(logging.DEBUG)
+
+    def _get_referenced_files(self, dataset_dir: Path) -> Dict[str, Set[str]]:
+        """Get set of audio files actually referenced in metadata for each split"""
+        referenced_files = {}
+        
+        for split in ["train", "validation", "test"]:
+            split_dir = dataset_dir / split
+            metadata_file = split_dir / "metadata.jsonl"
+            
+            if not split_dir.exists() or not metadata_file.exists():
+                continue
+                
+            files_in_metadata = set()
+            try:
+                with open(metadata_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        entry = json.loads(line)
+                        if "file_name" in entry:
+                            files_in_metadata.add(entry["file_name"])
+                            
+                referenced_files[split] = files_in_metadata
+                self.logger.info("Found %d files referenced in %s metadata", 
+                               len(files_in_metadata), split)
+                               
+            except Exception as e:
+                self.logger.warning("Error reading metadata for %s: %s", split, e)
+                referenced_files[split] = set()
+                
+        return referenced_files
+
+    def _copy_split_selectively(self, source_split_dir: Path, dest_split_dir: Path, 
+                               referenced_files: Set[str]):
+        """Copy only the files that are referenced in metadata"""
+        dest_split_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Always copy metadata.jsonl
+        metadata_file = source_split_dir / "metadata.jsonl"
+        if metadata_file.exists():
+            shutil.copy2(metadata_file, dest_split_dir / "metadata.jsonl")
+            
+        # Copy only referenced audio files
+        copied_count = 0
+        missing_files = []
+        
+        for file_name in referenced_files:
+            source_file = source_split_dir / file_name
+            if source_file.exists():
+                shutil.copy2(source_file, dest_split_dir / file_name)
+                copied_count += 1
+            else:
+                missing_files.append(file_name)
+                
+        self.logger.info("Copied %d audio files to %s", copied_count, dest_split_dir.name)
+        
+        if missing_files:
+            self.logger.warning("Missing %d files referenced in metadata: %s", 
+                              len(missing_files), missing_files[:5])  # Show first 5
 
     def upload(
         self,
@@ -48,12 +106,42 @@ class HuggingFaceUploader:
         # Upload dataset
         try:
             self.logger.info("Uploading files...")
-            # copy only splits and readme to a os tmp folder for upload
+            
+            # Get files actually referenced in metadata
+            referenced_files = self._get_referenced_files(dataset_dir)
+            
+            # Create temporary directory for selective upload
             temp_dir = Path(tempfile.gettempdir()) / "kokoro-dataset"
-            temp_dir.mkdir(exist_ok=True)
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+            temp_dir.mkdir(parents=True)
+            
+            # Copy only referenced files for each split
             for split in ["train", "validation", "test"]:
-                shutil.copytree(dataset_dir / split, temp_dir / split)
-            shutil.copy(dataset_dir / "README.md", temp_dir)
+                source_split_dir = dataset_dir / split
+                if source_split_dir.exists() and split in referenced_files:
+                    dest_split_dir = temp_dir / split
+                    self._copy_split_selectively(
+                        source_split_dir, 
+                        dest_split_dir, 
+                        referenced_files[split]
+                    )
+            
+            # Copy README
+            readme_path = dataset_dir / "README.md"
+            if readme_path.exists():
+                shutil.copy2(readme_path, temp_dir / "README.md")
+
+            # Verify what we're actually uploading
+            total_audio_files = 0
+            for split_dir in temp_dir.iterdir():
+                if split_dir.is_dir() and split_dir.name in ["train", "validation", "test"]:
+                    audio_files = list(split_dir.glob("*.wav"))
+                    total_audio_files += len(audio_files)
+                    self.logger.info("Uploading %d audio files from %s", 
+                                   len(audio_files), split_dir.name)
+
+            self.logger.info("Total audio files to upload: %d", total_audio_files)
 
             upload_folder(
                 repo_id=repo_id,
