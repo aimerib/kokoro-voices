@@ -45,17 +45,25 @@ class HuggingFaceUploader:
         # Upload dataset
         try:
             self.logger.info("Uploading files...")
+            # copy only splits and readme to a os tmp folder for upload
+            # temp_dir = Path(tempfile.gettempdir()) / "kokoro-dataset"
+            # temp_dir.mkdir(exist_ok=True)
+            # for split in ["train", "validation", "test"]:
+            #     shutil.copytree(dataset_dir / split, temp_dir / split)
+            # shutil.copy(dataset_dir / "README.md", temp_dir)
+
             upload_folder(
                 repo_id=repo_id,
                 repo_type="dataset",
                 folder_path=str(dataset_dir),
                 commit_message="Add Kokoro voice dataset",
-                ignore_patterns=["*.pyc", "__pycache__", ".DS_Store", "*.log"],
+                ignore_patterns=["*.pyc", "__pycache__", ".DS_Store", "*.log", ".temp"],
             )
             self.logger.info(
                 "✅ Upload complete: https://huggingface.co/datasets/%s",
                 repo_id,
             )
+            # shutil.rmtree(temp_dir)
 
         except Exception as e:
             self.logger.error("Error uploading dataset: %s", e)
@@ -156,7 +164,7 @@ This dataset was created using the Kokoro Pipeline for voice cloning with Kokoro
         if quality_report:
             # Calculate percentage kept separately to keep line length manageable
             percentage_kept = quality_report.get('total_kept', 0) / max(1, quality_report.get('total_analyzed', 1)) * 100
-            
+
             readme_content += f"""
 
 ## Quality Report
@@ -184,7 +192,6 @@ dataset/
 │   ├── metadata.jsonl
 │   └── segment_.wav
 └── test/
-├── metadata.jsonl
 └── segment_*.wav
 
 Each `metadata.jsonl` contains:
