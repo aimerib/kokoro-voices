@@ -728,11 +728,14 @@ def train_kokoro_projection(
                 # Project StyleTTS2 embedding to Kokoro format
                 kokoro_embedding = projection(style_embeddings.to(device))
                 
+                if kokoro_embedding.dim() == 1:
+                    kokoro_embedding = kokoro_embedding.unsqueeze(0)
+                
                 # Generate audio with Kokoro
                 with torch.no_grad():
                     generated_audio, _ = kokoro_model.forward_with_tokens(
                         input_ids, 
-                        kokoro_embedding.squeeze(0)
+                        kokoro_embedding
                     )
                 
                 # Convert both to mel spectrograms
