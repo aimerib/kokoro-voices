@@ -17,6 +17,39 @@ import soundfile as sf
 from typing import List, Tuple
 import librosa
 
+# ---------------------------------------------------------------------------
+# DANGER-ZONE: force full pickle loading
+# ---------------------------------------------------------------------------
+# StyleTTS2 checkpoints embed full Python objects.  We acknowledge the risk
+# and explicitly patch torch.load so that, when StyleTTS2 calls it without
+# specifying `weights_only`, we switch it back to the old (pre-2.6) behaviour
+# of allowing full unpickling.
+
+import warnings as _warnings
+
+_orig_torch_load = torch.load
+
+def _unsafe_full_load(*args, **kwargs):  # noqa: D401
+    """Wrapper around torch.load that disables the weights-only default.
+
+    This is *unsafe* because it allows executing pickled code.  We enable it
+    knowingly because StyleTTS2's official checkpoints rely on this.
+    """
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _orig_torch_load(*args, **kwargs)
+
+# Emit a single warning so users are aware.
+_warnings.warn(
+    "⚠  Overriding torch.load to allow full pickle unpickling.  This is "
+    "dangerous—only use with trusted checkpoints (StyleTTS2).",
+    RuntimeWarning,
+    stacklevel=2,
+)
+
+torch.load = _unsafe_full_load
+
+
 # Try to import StyleTTS2
 try:
     from styletts2 import tts
