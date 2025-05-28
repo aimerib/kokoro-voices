@@ -903,7 +903,7 @@ def train_kokoro_projection(
     
     best_loss = float('inf')
     patience_counter = 0
-    early_stopping_patience = 15  # Stop if no improvement for 15 epochs
+    early_stopping_patience = 100  # Stop if no improvement for 15 epochs
     min_improvement = 1e-4  # Minimum improvement to reset patience
     
     # Log initial embeddings to W&B if available
