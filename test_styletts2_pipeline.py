@@ -11,6 +11,13 @@ import tempfile
 import os
 from pathlib import Path
 
+import torch.serialization as _ts  # type: ignore
+try:
+    _ts.add_safe_globals([getattr])  # allowlist getattr globally
+except Exception:
+    pass  # running on PyTorch<2.6 or already patched
+
+
 def test_audio_feature_extraction():
     """Test the audio feature extraction fallback."""
     print("Testing audio feature extraction...")
