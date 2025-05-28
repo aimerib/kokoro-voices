@@ -695,9 +695,20 @@ def train_kokoro_projection(
     print("STAGE 2: Kokoro Projection Training")
     print("="*60)
     
+    # Ensure style embeddings are on the right device and don't require grad
+    # (we only want to train the projection, not the input embeddings)
+    style_embeddings = style_embeddings.to(device).detach()
+    
     # Initialize projection layer
     style_dim = style_embeddings.shape[-1]
     projection = StyleToKokoroProjection(style_dim, kokoro_dim=256).to(device)
+    
+    # Ensure projection parameters require gradients
+    for param in projection.parameters():
+        param.requires_grad_(True)
+    
+    print(f"Projection model has {sum(p.numel() for p in projection.parameters())} parameters")
+    print(f"Projection parameters require grad: {all(p.requires_grad for p in projection.parameters())}")
     
     # Load Kokoro model for validation
     kokoro_model = KModel()
@@ -734,6 +745,10 @@ def train_kokoro_projection(
     
     kokoro_model = kokoro_model.to(device)
     kokoro_model.eval()
+    
+    # Freeze Kokoro model parameters to prevent them from being updated
+    for param in kokoro_model.parameters():
+        param.requires_grad_(False)
     
     # Setup mel transform for comparison
     mel_transform = torchaudio.transforms.MelSpectrogram(
@@ -797,12 +812,11 @@ def train_kokoro_projection(
                 if kokoro_embedding.dim() == 1:
                     kokoro_embedding = kokoro_embedding.unsqueeze(0)
                 
-                # Generate audio with Kokoro
-                with torch.no_grad():
-                    generated_audio, _ = kokoro_model.forward_with_tokens(
-                        input_ids, 
-                        kokoro_embedding
-                    )
+                # Generate audio with Kokoro - keep gradients for the embedding
+                generated_audio, _ = kokoro_model.forward_with_tokens(
+                    input_ids, 
+                    kokoro_embedding
+                )
                 
                 # Convert both to mel spectrograms
                 target_audio = target_audio.to(device)
@@ -823,10 +837,17 @@ def train_kokoro_projection(
                 
                 loss = F.mse_loss(generated_mel, target_mel)
                 
-                # Ensure loss requires grad
+                # Check if loss has gradients - if not, there's a problem with the computation graph
                 if not loss.requires_grad:
-                    print("Warning: Loss doesn't require grad - skipping batch")
-                    continue
+                    print(f"Warning: Loss doesn't require grad. Kokoro embedding grad: {kokoro_embedding.requires_grad}")
+                    print(f"Generated audio grad: {generated_audio.requires_grad}")
+                    print(f"Generated mel grad: {generated_mel.requires_grad}")
+                    # Try to force gradient computation by adding a small regularization term
+                    reg_loss = 0.001 * torch.sum(kokoro_embedding ** 2)
+                    loss = loss + reg_loss
+                    if not loss.requires_grad:
+                        print("Still no gradients - skipping batch")
+                        continue
                 
                 # Backward pass
                 optimizer.zero_grad()
