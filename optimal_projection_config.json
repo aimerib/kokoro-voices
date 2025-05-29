@@ -1,0 +1,17 @@
+{
+  "hidden_dim": 512,
+  "num_layers": 2,
+  "dropout": 0.1617133731590296,
+  "activation": "relu",
+  "normalization": "layer",
+  "lr": 0.00031304671498063696,
+  "batch_size": 8,
+  "weight_decay": 3.302562271536057e-06,
+  "grad_clip": 1.846263410092622,
+  "mel_l1_weight": 0.23042650977238305,
+  "spectral_conv_weight": 0.2822633041696316,
+  "cosine_weight": 0.1757828735941619,
+  "centroid_weight": 0.18877395866922594,
+  "norm_reg_weight": 0.024094526382500217,
+  "smoothness_weight": 0.099250419143429
+}

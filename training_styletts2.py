@@ -199,28 +199,41 @@ class StyleToKokoroProjection(nn.Module):
     
     This learns a mapping from StyleTTS2's style space to Kokoro's 256-dim
     voice embedding space, preserving voice characteristics.
+    
+    Uses optimized architecture from hyperparameter optimization.
     """
     
-    def __init__(self, style_dim: int, kokoro_dim: int = 256, hidden_dim: int = 512):
+    def __init__(self, style_dim: int, kokoro_dim: int = 256, 
+                 hidden_dim: int = 512, num_layers: int = 2, dropout: float = 0.1617):
         super().__init__()
         self.style_dim = style_dim
         self.kokoro_dim = kokoro_dim
         
-        # Multi-layer projection with residual connections
-        self.projection = nn.Sequential(
-            nn.Linear(style_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
+        # Optimized architecture: 512 hidden, 2 layers, ~16% dropout
+        layers = []
+        in_dim = style_dim
+        
+        for i in range(num_layers):
+            # Linear layer
+            layers.append(nn.Linear(in_dim, hidden_dim))
             
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
+            # Layer normalization (found to be optimal)
+            layers.append(nn.LayerNorm(hidden_dim))
             
-            nn.Linear(hidden_dim, kokoro_dim),
-            nn.Tanh()  # Kokoro embeddings are typically in [-1, 1] range
-        )
+            # ReLU activation (found to be optimal)
+            layers.append(nn.ReLU())
+            
+            # Dropout for regularization
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            
+            in_dim = hidden_dim
+        
+        # Final output layer
+        layers.append(nn.Linear(hidden_dim, kokoro_dim))
+        layers.append(nn.Tanh())  # Kokoro embeddings are typically in [-1, 1] range
+        
+        self.projection = nn.Sequential(*layers)
         
         # Initialize with small weights for stable training
         self.apply(self._init_weights)
@@ -604,7 +617,8 @@ def compute_voice_similarity_loss(
     target_audio: torch.Tensor,
     generated_audio: torch.Tensor,
     mel_transform,
-    device: str
+    device: str,
+    loss_weights: Optional[Dict[str, float]] = None
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute a proper voice similarity loss that compares generated audio
@@ -616,10 +630,22 @@ def compute_voice_similarity_loss(
         generated_audio: Audio generated with current embedding
         mel_transform: Mel spectrogram transform
         device: Device for computation
+        loss_weights: Optional dictionary of loss weights (uses optimized defaults)
         
     Returns:
         Tuple of (total_loss, loss_components_dict)
     """
+    # Use optimized weights from hyperparameter optimization
+    if loss_weights is None:
+        loss_weights = {
+            'mel_l1_weight': 0.23042650977238305,
+            'spectral_conv_weight': 0.2822633041696316,
+            'cosine_weight': 0.1757828735941619,
+            'centroid_weight': 0.18877395866922594,
+            'norm_reg_weight': 0.024094526382500217,
+            'smoothness_weight': 0.099250419143429
+        }
+    
     loss_components = {}
     
     # Ensure audio tensors are the same length
@@ -678,14 +704,14 @@ def compute_voice_similarity_loss(
     smoothness_loss = torch.mean(torch.abs(kokoro_embedding)) * 0.1  # Encourage smaller absolute values
     loss_components['smoothness_loss'] = smoothness_loss.item()
     
-    # Combine losses with weights that prioritize voice similarity
+    # Combine losses with optimized weights
     total_loss = (
-        0.4 * mel_l1_loss +           # Primary reconstruction loss
-        0.2 * spectral_conv_loss +    # Normalized reconstruction
-        0.2 * cosine_loss +           # Perceptual similarity
-        0.1 * centroid_loss +         # Timbre preservation
-        0.05 * norm_reg_loss +        # Reasonable embedding norm
-        0.05 * smoothness_loss        # Prevent extreme values
+        loss_weights['mel_l1_weight'] * mel_l1_loss +
+        loss_weights['spectral_conv_weight'] * spectral_conv_loss +
+        loss_weights['cosine_weight'] * cosine_loss +
+        loss_weights['centroid_weight'] * centroid_loss +
+        loss_weights['norm_reg_weight'] * norm_reg_loss +
+        loss_weights['smoothness_weight'] * smoothness_loss
     )
     
     loss_components['total_loss'] = total_loss.item()
@@ -798,7 +824,7 @@ def train_kokoro_projection(
     style_embeddings: torch.Tensor,
     target_samples: List[Tuple[str, torch.Tensor]],
     epochs: int = 100,
-    lr: float = 1e-3,
+    lr: float = 3.13e-4,  # Optimized learning rate
     device: str = "cpu",
     logger: Optional[TrainingLogger] = None,
     log_audio_every: int = 10
@@ -890,9 +916,13 @@ def train_kokoro_projection(
         power=1,
     ).to(device)
     
-    # Setup optimizer with lower learning rate for stability
-    optimizer = torch.optim.Adam(projection.parameters(), lr=lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+    # Setup optimizer with optimized parameters from hyperparameter search
+    optimizer = torch.optim.Adam(
+        projection.parameters(), 
+        lr=lr, 
+        weight_decay=3.302562271536057e-06  # Optimized weight decay
+    )
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15)  # More patience
     
     # G2P pipeline
     from kokoro import KPipeline
@@ -970,7 +1000,7 @@ def train_kokoro_projection(
                 # Backward pass
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(projection.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(projection.parameters(), 1.846)  # Optimized grad clip
                 optimizer.step()
                 
                 epoch_loss += loss.item()
@@ -1177,7 +1207,7 @@ def generate_audio_samples_for_logging(
 def train_styletts2_to_kokoro(
     data_root: str | Path,
     epochs_projection: int = 50,  # Reduced from 100 to prevent overtraining
-    lr_projection: float = 5e-4,  # Reduced from 1e-3 for more stability
+    lr_projection: float = 3.13e-4,  # Optimized learning rate from hyperparameter search
     out: str = "output",
     name: str = "my_voice",
     use_tensorboard: bool = False,
@@ -1496,7 +1526,7 @@ if __name__ == "__main__":
     
     # Training arguments
     ap.add_argument("--epochs-projection", type=int, default=50, help="Epochs for projection training (reduced default)")
-    ap.add_argument("--lr-projection", type=float, default=5e-4, help="Learning rate for projection (reduced default)")
+    ap.add_argument("--lr-projection", type=float, default=3.13e-4, help="Learning rate for projection (reduced default)")
     
     # Output arguments
     ap.add_argument("--name", type=str, default="my_voice", help="Output voice name")
